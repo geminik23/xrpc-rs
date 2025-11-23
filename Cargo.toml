@@ -1,6 +1,6 @@
 [package]
 name = "xrpc-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 description = "async RPC library optimized for shared memory communication"
@@ -30,14 +30,12 @@ crossbeam = "0.8"
 shared_memory = "0.12"
 raw_sync = "0.1"
 
-# Compression (optional)
-lz4 = { version = "1.24", optional = true }
-zstd = { version = "0.13", optional = true }
+# Compression
+lz4 = "1.24"
+zstd = "0.13"
 
 [features]
 default = []
-compression-lz4 = ["lz4"]
-compression-zstd = ["zstd"]
 
 [lib]
 name = "xrpc"

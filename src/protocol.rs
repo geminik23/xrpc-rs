@@ -78,9 +78,7 @@ impl MessageType {
 #[repr(u8)]
 pub enum CompressionType {
     None = 0,
-    #[cfg(feature = "compression-lz4")]
     Lz4 = 1,
-    #[cfg(feature = "compression-zstd")]
     Zstd = 2,
 }
 
@@ -94,9 +92,7 @@ impl CompressionType {
     pub fn from_u8(value: u8) -> Result<Self> {
         match value {
             0 => Ok(CompressionType::None),
-            #[cfg(feature = "compression-lz4")]
             1 => Ok(CompressionType::Lz4),
-            #[cfg(feature = "compression-zstd")]
             2 => Ok(CompressionType::Zstd),
             _ => Err(RpcError::InvalidMessage(format!(
                 "Unknown compression type: {}",
@@ -281,11 +277,15 @@ impl Message {
             return Err(TransportError::Protocol("Method name too long".to_string()));
         }
 
+        // Compress payload if needed
+        let payload_to_write = self.compress_payload()?;
+
         let metadata_bytes = bincode::serialize(&self.metadata)
             .map_err(|e| TransportError::Protocol(e.to_string()))?;
 
         // Calculate total size
-        let total_size = MIN_HEADER_SIZE + method_len + self.payload.len() + metadata_bytes.len();
+        let total_size =
+            MIN_HEADER_SIZE + method_len + payload_to_write.len() + metadata_bytes.len();
 
         if total_size > MAX_MESSAGE_SIZE {
             return Err(TransportError::MessageTooLarge {
@@ -325,14 +325,25 @@ impl Message {
         buf.put_slice(method_bytes);
 
         // Payload length and data
-        buf.put_u32_le(self.payload.len() as u32);
-        buf.put_slice(&self.payload);
+        buf.put_u32_le(payload_to_write.len() as u32);
+        buf.put_slice(&payload_to_write);
 
         // Metadata length and data
         buf.put_u32_le(metadata_bytes.len() as u32);
         buf.put_slice(&metadata_bytes);
 
         Ok(buf)
+    }
+
+    /// Compress payload based on compression type
+    fn compress_payload(&self) -> TransportResult<Vec<u8>> {
+        match self.metadata.compression {
+            CompressionType::None => Ok(self.payload.to_vec()),
+            CompressionType::Lz4 => lz4::block::compress(&self.payload, None, false)
+                .map_err(|e| TransportError::Protocol(format!("LZ4 compression failed: {}", e))),
+            CompressionType::Zstd => zstd::bulk::compress(&self.payload, 3)
+                .map_err(|e| TransportError::Protocol(format!("Zstd compression failed: {}", e))),
+        }
     }
 
     /// Decode message from wire bytes
@@ -386,11 +397,10 @@ impl Message {
         let method = String::from_utf8(method_bytes)
             .map_err(|e| TransportError::Protocol(format!("Invalid method name: {}", e)))?;
 
-        // Payload
+        // Payload (compressed)
         let payload_len = buf.get_u32_le() as usize;
         let mut payload_bytes = vec![0u8; payload_len];
         buf.copy_to_slice(&mut payload_bytes);
-        let payload = Bytes::from(payload_bytes);
 
         // Metadata
         let metadata_len = buf.get_u32_le() as usize;
@@ -399,6 +409,9 @@ impl Message {
         let metadata: MessageMetadata = bincode::deserialize(&metadata_bytes)
             .map_err(|e| TransportError::Protocol(format!("Invalid metadata: {}", e)))?;
 
+        // Decompress payload if needed
+        let payload = Self::decompress_payload(&payload_bytes, &metadata)?;
+
         Ok(Self {
             id,
             msg_type,
@@ -406,6 +419,23 @@ impl Message {
             payload,
             metadata,
         })
+    }
+
+    /// Decompress payload based on compression type in metadata
+    fn decompress_payload(compressed: &[u8], metadata: &MessageMetadata) -> TransportResult<Bytes> {
+        let decompressed = match metadata.compression {
+            CompressionType::None => compressed.to_vec(),
+            CompressionType::Lz4 => lz4::block::decompress(compressed, None).map_err(|e| {
+                TransportError::Protocol(format!("LZ4 decompression failed: {}", e))
+            })?,
+            CompressionType::Zstd => {
+                zstd::bulk::decompress(compressed, MAX_MESSAGE_SIZE).map_err(|e| {
+                    TransportError::Protocol(format!("Zstd decompression failed: {}", e))
+                })?
+            }
+        };
+
+        Ok(Bytes::from(decompressed))
     }
 
     pub fn deserialize_payload<'de, T: Deserialize<'de>>(&'de self) -> Result<T> {

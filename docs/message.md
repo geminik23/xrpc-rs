@@ -101,8 +101,8 @@ Total: 19 bytes minimum header
   - timeout_ms: Option<u32>
   - compression: CompressionType (u8)
     - 0 = None
-    - 1 = Lz4 (feature: compression-lz4)
-    - 2 = Zstd (feature: compression-zstd)
+    - 1 = Lz4
+    - 2 = Zstd
   - stream_id: Option<u64>
   - sequence_number: Option<u64>
 
@@ -177,15 +177,14 @@ Metadata fields:
 
 ### Compression Support
 
-Compression is optional and requires feature flags.
-
-Enable with:
-- `features = ["compression-lz4"]` - LZ4 compression
-- `features = ["compression-zstd"]` - Zstandard compression
-
 Available compression types:
-- `CompressionType::None` - No compression (always available)
-- `CompressionType::Lz4` - LZ4 compression (requires feature)
-- `CompressionType::Zstd` - Zstandard compression (requires feature)
+- `CompressionType::None` - No compression (default)
+- `CompressionType::Lz4` - LZ4 compression (fast, good ratio)
+- `CompressionType::Zstd` - Zstandard compression (better ratio, slightly slower)
 
-Currently compression types are defined but compression logic is not yet implemented.
+Compression is always available. Choose the compression type at runtime by setting the metadata:
+
+```rust
+let mut msg = Message::call("method", data)?;
+msg.metadata.compression = CompressionType::Lz4;
+```
