@@ -7,3 +7,6 @@ pub mod transport;
 
 pub use error::{Result, RpcError, TransportError, TransportResult};
 pub use protocol::{Message, MessageId, MessageType};
+pub use transport::channel::{ChannelConfig, ChannelTransport};
+pub use transport::shared_memory::{RetryPolicy, SharedMemoryConfig, SharedMemoryTransport};
+pub use transport::{Transport, TransportStats};

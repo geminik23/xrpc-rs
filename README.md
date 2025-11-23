@@ -2,7 +2,7 @@
 
 Fast local RPC library for Rust using shared memory.
 
-**Status:** Very early prototype - not production-ready.
+**Status:** Very early prototype - It is working but not production-ready.
 
 ## Documentation
 
@@ -11,9 +11,14 @@ Fast local RPC library for Rust using shared memory.
 ## Future Plans
 
 - [x] add support streaming & compression on message
-- [ ] Transport layer abstraction
-- [ ] Local SharedMemory Transport implementation
-- [ ] Cross Process SharedMemory Transport implementation
+- [x] Transport layer abstraction
+- [x] Local Channel Transport implementation
+- [x] SharedMemory Transport implementation
+- [x] Heartbeat abstraction for transport reliability
+- [ ] DirectTransport (skip Message protocol overhead)
+- [ ] ZeroCopyTransport (Arc-based, no serialization)
+- [ ] Docs for Transport & Examples
+
 
 ## License
 

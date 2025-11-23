@@ -16,6 +16,31 @@ pub enum TransportError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    #[error("Send failed after {attempts} attempts: {reason}")]
+    SendFailed { attempts: usize, reason: String },
+
+    #[error("Receive failed after {attempts} attempts: {reason}")]
+    ReceiveFailed { attempts: usize, reason: String },
+
+    #[error("Timeout after {duration_ms}ms: {operation}")]
+    Timeout { duration_ms: u64, operation: String },
+
+    #[error("Connection to '{name}' failed after {attempts} attempts: {reason}")]
+    ConnectionFailed {
+        name: String,
+        attempts: usize,
+        reason: String,
+    },
+
+    #[error("Not connected")]
+    NotConnected,
+
+    #[error("Invalid buffer state: {0}")]
+    InvalidBufferState(String),
+
+    #[error("Shared memory creation failed for '{name}': {reason}")]
+    SharedMemoryCreation { name: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, RpcError>;
