@@ -3,6 +3,7 @@
 //! Fast inter-process communication for Rust.
 pub mod error;
 pub mod protocol;
+pub mod transport;
 
 pub use error::{Result, RpcError, TransportError, TransportResult};
 pub use protocol::{Message, MessageId, MessageType};

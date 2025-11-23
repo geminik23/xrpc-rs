@@ -14,7 +14,7 @@
 +----------------+
 | Message ID     |  8 bytes (u64, little-endian) 
 +----------------+
-| Message Type   |  1 byte - call/reply/notification/error
+| Message Type   |  1 byte - call/reply/notification/error/stream
 +----------------+
     |
     v
@@ -48,26 +48,26 @@ Easy to spot in hex dumps. Version is 1 for now.
 ## Message Types
 
 ```txt
-0 = Call        - client calling a method
-1 = Reply       - server responding to call
+0 = Call         - client calling a method
+1 = Reply        - server responding to call
 2 = Notification - one-way message (no response)
-3 = Error       - error response
+3 = Error        - error response
+4 = StreamChunk  - streaming data chunk
+5 = StreamEnd    - end of stream
 ```
-
-TODO: Maybe add streaming types later?
-- 4 = StreamChunk
-- 5 = StreamEnd
 
 ## Flags (1 byte)
 
 ```
 Bit 0 (0x01): compressed
-Bit 1 (0x02): streaming (reserved)
+Bit 1 (0x02): streaming
 Bit 2 (0x04): batch (reserved)
 Bits 3-7: unused
 ```
 
-Currently only checking compressed flag. Others are for future use.
+- **compressed**: Set when payload is compressed
+- **streaming**: Set for streaming messages
+- **batch**: Reserved for batch operations (future use)
 
 ## Field Details
 
@@ -78,7 +78,7 @@ Currently only checking compressed flag. Others are for future use.
 - Flags: 1 byte
 - Length: 4 bytes (little-endian u32) - total length AFTER the first 10 bytes
 - Message ID: 8 bytes (little-endian u64) - auto-incrementing
-- Type: 1 byte (0-3 currently)
+- Type: 1 byte (0-5)
 
 Total: 19 bytes minimum header
 
@@ -86,7 +86,7 @@ Total: 19 bytes minimum header
 
 - Length: u16 (max 65535)
 - Name: UTF-8 string
-- Empty for Reply/Error messages
+- Empty for Reply/Error/Stream messages
 
 ### Payload
 
@@ -100,6 +100,11 @@ Total: 19 bytes minimum header
   - timestamp: u64 (microseconds since epoch)
   - timeout_ms: Option<u32>
   - compression: CompressionType (u8)
+    - 0 = None
+    - 1 = Lz4 (feature: compression-lz4)
+    - 2 = Zstd (feature: compression-zstd)
+  - stream_id: Option<u64>
+  - sequence_number: Option<u64>
 
 ## Constants
 
@@ -142,3 +147,45 @@ sequenceDiagram
     Client->>Server: Call (id=456, "bad_method")
     Server->>Client: Error (id=456, "not found")
 ```
+
+### Streaming
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    Client->>Server: Call (id=789, "stream_data")
+    Server->>Client: StreamChunk (stream_id=1, seq=0, data)
+    Server->>Client: StreamChunk (stream_id=1, seq=1, data)
+    Server->>Client: StreamChunk (stream_id=1, seq=2, data)
+    Server->>Client: StreamEnd (stream_id=1)
+```
+
+## Features
+
+### Streaming Support
+
+Streaming is always available in the protocol.
+
+API:
+- `Message::stream_chunk(stream_id, sequence, data)` - Create stream chunk
+- `Message::stream_end(stream_id)` - Signal end of stream
+
+Metadata fields:
+- `stream_id: Option<u64>` - Identifies the stream
+- `sequence_number: Option<u64>` - Ensures ordered delivery
+
+### Compression Support
+
+Compression is optional and requires feature flags.
+
+Enable with:
+- `features = ["compression-lz4"]` - LZ4 compression
+- `features = ["compression-zstd"]` - Zstandard compression
+
+Available compression types:
+- `CompressionType::None` - No compression (always available)
+- `CompressionType::Lz4` - LZ4 compression (requires feature)
+- `CompressionType::Zstd` - Zstandard compression (requires feature)
+
+Currently compression types are defined but compression logic is not yet implemented.

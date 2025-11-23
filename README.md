@@ -10,7 +10,7 @@ Fast local RPC library for Rust using shared memory.
 
 ## Future Plans
 
-- [ ] add support streaming & compression on message
+- [x] add support streaming & compression on message
 - [ ] Transport layer abstraction
 - [ ] Local SharedMemory Transport implementation
 - [ ] Cross Process SharedMemory Transport implementation

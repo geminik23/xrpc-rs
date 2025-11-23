@@ -48,9 +48,8 @@ pub enum MessageType {
     Reply = 1,
     Notification = 2,
     Error = 3,
-    // TODO: for later
-    // StreamChunk = 4,
-    // StreamEnd = 5,
+    StreamChunk = 4,
+    StreamEnd = 5,
 }
 
 impl MessageType {
@@ -60,6 +59,8 @@ impl MessageType {
             1 => Ok(MessageType::Reply),
             2 => Ok(MessageType::Notification),
             3 => Ok(MessageType::Error),
+            4 => Ok(MessageType::StreamChunk),
+            5 => Ok(MessageType::StreamEnd),
             _ => Err(RpcError::InvalidMessage(format!(
                 "Unknown message type: {}",
                 value
@@ -73,13 +74,14 @@ impl MessageType {
 }
 
 /// Compression algorithm used for message payload
-///
-/// Currently only "None" is supported.
-/// Other algorithms can be added in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CompressionType {
     None = 0,
+    #[cfg(feature = "compression-lz4")]
+    Lz4 = 1,
+    #[cfg(feature = "compression-zstd")]
+    Zstd = 2,
 }
 
 impl Default for CompressionType {
@@ -92,6 +94,10 @@ impl CompressionType {
     pub fn from_u8(value: u8) -> Result<Self> {
         match value {
             0 => Ok(CompressionType::None),
+            #[cfg(feature = "compression-lz4")]
+            1 => Ok(CompressionType::Lz4),
+            #[cfg(feature = "compression-zstd")]
+            2 => Ok(CompressionType::Zstd),
             _ => Err(RpcError::InvalidMessage(format!(
                 "Unknown compression type: {}",
                 value
@@ -105,8 +111,6 @@ impl CompressionType {
 }
 
 /// Message flags packed into a single byte
-///
-/// streaming and batch flags are reserved for future use
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MessageFlags {
     /// Whether the message payload is compressed
@@ -146,14 +150,16 @@ impl MessageFlags {
 /// Optional metadata for messages
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageMetadata {
-    /// Timestamp when message was created (ms since epoch)
+    /// Timestamp when message was created (microseconds since epoch)
     pub timestamp: u64,
     /// Timeout in milliseconds
     pub timeout_ms: Option<u32>,
     /// Compression algorithm used
-    ///
-    /// Currently only "None" is supported
     pub compression: CompressionType,
+    /// Stream ID for streaming messages
+    pub stream_id: Option<u64>,
+    /// Sequence number for ordered delivery
+    pub sequence_number: Option<u64>,
 }
 
 impl MessageMetadata {
@@ -165,6 +171,8 @@ impl MessageMetadata {
                 .as_micros() as u64,
             timeout_ms: None,
             compression: CompressionType::None,
+            stream_id: None,
+            sequence_number: None,
         }
     }
 
@@ -175,6 +183,13 @@ impl MessageMetadata {
 
     pub fn with_compression(mut self, compression: CompressionType) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Set stream ID
+    pub fn with_stream(mut self, stream_id: u64, sequence: u64) -> Self {
+        self.stream_id = Some(stream_id);
+        self.sequence_number = Some(sequence);
         self
     }
 }
@@ -231,6 +246,29 @@ impl Message {
             method: String::new(),
             payload: Bytes::from(payload),
             metadata: MessageMetadata::new(),
+        }
+    }
+
+    /// Create a stream chunk message
+    pub fn stream_chunk<T: Serialize>(stream_id: u64, sequence: u64, data: T) -> Result<Self> {
+        let payload = bincode::serialize(&data)?;
+        Ok(Self {
+            id: MessageId::new(),
+            msg_type: MessageType::StreamChunk,
+            method: String::new(),
+            payload: Bytes::from(payload),
+            metadata: MessageMetadata::new().with_stream(stream_id, sequence),
+        })
+    }
+
+    /// Create a stream end message
+    pub fn stream_end(stream_id: u64) -> Self {
+        Self {
+            id: MessageId::new(),
+            msg_type: MessageType::StreamEnd,
+            method: String::new(),
+            payload: Bytes::new(),
+            metadata: MessageMetadata::new().with_stream(stream_id, 0),
         }
     }
 
@@ -468,5 +506,47 @@ mod tests {
         assert_eq!(decoded.method, msg.method);
         assert_eq!(decoded.payload, msg.payload);
         assert_eq!(decoded.metadata.timeout_ms, Some(1000));
+    }
+
+    #[test]
+    fn test_streaming_messages() {
+        #[derive(Serialize, Deserialize, Debug, PartialEq)]
+        struct ChunkData {
+            value: String,
+        }
+
+        let stream_id = 42u64;
+        let sequence = 5u64;
+        let data = ChunkData {
+            value: "chunk data".to_string(),
+        };
+
+        // Test stream chunk
+        let chunk = Message::stream_chunk(stream_id, sequence, data).unwrap();
+        assert_eq!(chunk.msg_type, MessageType::StreamChunk);
+        assert_eq!(chunk.metadata.stream_id, Some(stream_id));
+        assert_eq!(chunk.metadata.sequence_number, Some(sequence));
+
+        let decoded_data: ChunkData = chunk.deserialize_payload().unwrap();
+        assert_eq!(decoded_data.value, "chunk data");
+
+        // Test encode/decode round trip
+        let encoded = chunk.encode().unwrap();
+        let decoded = Message::decode(encoded).unwrap();
+        assert_eq!(decoded.msg_type, MessageType::StreamChunk);
+        assert_eq!(decoded.metadata.stream_id, Some(stream_id));
+        assert_eq!(decoded.metadata.sequence_number, Some(sequence));
+
+        // Test stream end
+        let end = Message::stream_end(stream_id);
+        assert_eq!(end.msg_type, MessageType::StreamEnd);
+        assert_eq!(end.metadata.stream_id, Some(stream_id));
+        assert_eq!(end.payload.len(), 0);
+
+        // Test stream end encode/decode
+        let encoded_end = end.encode().unwrap();
+        let decoded_end = Message::decode(encoded_end).unwrap();
+        assert_eq!(decoded_end.msg_type, MessageType::StreamEnd);
+        assert_eq!(decoded_end.metadata.stream_id, Some(stream_id));
     }
 }
