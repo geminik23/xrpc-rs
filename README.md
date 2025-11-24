@@ -1,6 +1,8 @@
 # xRPC-rs
 
-Fast local RPC library for Rust using shared memory.
+Fast RPC library for Rust with multiple transport implementations.
+
+This library provides efficient message passing with various transports including in-process channels, shared memory for IPC, and planned support for network transports (TCP, etc.). While currently focused on local communication, the architecture is designed to support both local and remote RPC scenarios.
 
 **Status:** Very early prototype - It is working but not production-ready.
 
@@ -10,14 +12,27 @@ Fast local RPC library for Rust using shared memory.
 
 ## Future Plans
 
-- [x] add support streaming & compression on message
+### Completed
+
+- [x] Add support for streaming & compression on message
 - [x] Transport layer abstraction
 - [x] Local Channel Transport implementation
 - [x] SharedMemory Transport implementation
 - [x] Heartbeat abstraction for transport reliability
-- [ ] DirectTransport (skip Message protocol overhead)
-- [ ] ZeroCopyTransport (Arc-based, no serialization)
-- [ ] Docs for Transport & Examples
+- [x] RawTransport (skip Message protocol overhead)
+- [x] ArcTransport (Arc-based, no serialization)
+
+### Refactoring Tasks
+
+- [ ] Module reorganization: Split `protocol.rs` into `message` module.
+- [ ] Codec trait abstraction: Decouple serialization format:
+  - support bincode, JSON (for debugging), MsgPack (for network?), etc.
+- [ ] Relocate `TypedChannel`
+
+### Planned Features
+
+- [ ] Advanced network transports (TCP, etc.)
+- [ ] Documentation for Transports & Examples
 
 
 ## License

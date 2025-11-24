@@ -4,9 +4,13 @@ use std::fmt::Debug;
 
 use crate::error::TransportResult;
 
+pub mod arc;
 pub mod channel;
+pub mod direct;
 pub mod shared_memory;
 pub mod utils;
+
+pub use utils::spawn_weak_loop;
 
 /// Transport trait for abstracting communication mechanisms
 #[async_trait]
