@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::marker::PhantomData;
+
 use std::sync::Arc;
 
 use crate::error::{TransportError, TransportResult};
@@ -94,35 +94,6 @@ impl<T: Transport> std::fmt::Debug for RawTransport<T> {
     }
 }
 
-/// Typed channel for direct communication
-pub struct TypedChannel<Req, Resp, T: Transport> {
-    transport: RawTransport<T>,
-    _phantom: PhantomData<(Req, Resp)>,
-}
-
-impl<Req, Resp, T: Transport> TypedChannel<Req, Resp, T> {
-    pub fn new(transport: T) -> Self {
-        Self {
-            transport: RawTransport::new(transport),
-            _phantom: PhantomData,
-        }
-    }
-
-    pub async fn send(&self, request: &Req) -> TransportResult<()>
-    where
-        Req: Serialize,
-    {
-        self.transport.send_direct(request).await
-    }
-
-    pub async fn recv(&self) -> TransportResult<Resp>
-    where
-        Resp: for<'de> Deserialize<'de>,
-    {
-        self.transport.recv_direct().await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,11 +103,6 @@ mod tests {
     struct TestRequest {
         id: u64,
         name: String,
-    }
-
-    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-    struct TestResponse {
-        result: i32,
     }
 
     #[tokio::test]
@@ -156,28 +122,5 @@ mod tests {
         let received: TestRequest = dt2.recv_direct().await.unwrap();
 
         assert_eq!(received, req);
-    }
-
-    #[tokio::test]
-    async fn test_typed_channel() {
-        let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
-
-        let ch1: TypedChannel<TestRequest, TestResponse, _> = TypedChannel::new(t1);
-        let ch2: TypedChannel<TestResponse, TestRequest, _> = TypedChannel::new(t2);
-
-        let req = TestRequest {
-            id: 456,
-            name: "hello".to_string(),
-        };
-
-        ch1.send(&req).await.unwrap();
-        let received: TestRequest = ch2.recv().await.unwrap();
-        assert_eq!(received, req);
-
-        let resp = TestResponse { result: 42 };
-        ch2.send(&resp).await.unwrap();
-        let received_resp: TestResponse = ch1.recv().await.unwrap();
-        assert_eq!(received_resp, resp);
     }
 }

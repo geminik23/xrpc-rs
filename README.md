@@ -24,15 +24,14 @@ This library provides efficient message passing with various transports includin
 
 ### Refactoring Tasks
 
-- [ ] Module reorganization: Split `protocol.rs` into `message` module.
-- [ ] Codec trait abstraction: Decouple serialization format:
-  - support bincode, JSON (for debugging), MsgPack (for network?), etc.
-- [ ] Relocate `TypedChannel`
+- [x] Module reorganization: Split `protocol.rs` into `message` module.
+- [x] Codec trait abstraction: Decouple serialization format
+- [x] Relocate `TypedChannel`
 
 ### Planned Features
 
-- [ ] Advanced network transports (TCP, etc.)
 - [ ] Documentation for Transports & Examples
+- [ ] Advanced network transports (TCP, etc.) ...
 
 
 ## License

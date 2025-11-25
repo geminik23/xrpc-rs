@@ -51,3 +51,9 @@ impl From<bincode::Error> for RpcError {
         RpcError::Serialization(err.to_string())
     }
 }
+
+impl From<serde_json::Error> for RpcError {
+    fn from(err: serde_json::Error) -> Self {
+        RpcError::Serialization(err.to_string())
+    }
+}
