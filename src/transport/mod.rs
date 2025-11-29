@@ -8,6 +8,7 @@ pub mod arc;
 pub mod channel;
 pub mod direct;
 pub mod shared_memory;
+pub mod tcp;
 pub mod utils;
 
 pub use utils::spawn_weak_loop;

@@ -131,7 +131,7 @@ unsafe impl Sync for SharedMemoryRingBuffer {}
 
 impl SharedMemoryRingBuffer {
     fn create(name: &str, capacity: usize) -> TransportResult<Self> {
-        if capacity < MIN_BUFFER_SIZE || capacity > MAX_BUFFER_SIZE {
+        if !(MIN_BUFFER_SIZE..=MAX_BUFFER_SIZE).contains(&capacity) {
             return Err(TransportError::InvalidBufferState(format!(
                 "Invalid buffer size: {}",
                 capacity

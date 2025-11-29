@@ -74,16 +74,12 @@ impl MessageType {
 /// Compression algorithm used for message payload
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum CompressionType {
+    #[default]
     None = 0,
     Lz4 = 1,
     Zstd = 2,
-}
-
-impl Default for CompressionType {
-    fn default() -> Self {
-        CompressionType::None
-    }
 }
 
 impl CompressionType {

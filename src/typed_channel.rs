@@ -18,7 +18,7 @@ impl<Req, Resp, T: Transport> TypedChannel<Req, Resp, T, BincodeCodec> {
     pub fn new(transport: T) -> Self {
         Self {
             transport,
-            codec: BincodeCodec::default(),
+            codec: BincodeCodec,
             _phantom: PhantomData,
         }
     }
