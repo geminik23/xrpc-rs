@@ -10,7 +10,7 @@ This library provides efficient message passing with various transports includin
 
 xRPC follows a layered architecture:
 
-- **Layer 1: Transport** - Low-level byte transmission (TCP, Unix, UDP, SharedMemory, Channel)
+- **Layer 1: Transport** - Low-level byte transmission (TCP, Unix, SharedMemory, Channel)
 - **Layer 2: Message** - Protocol format with serialization/deserialization
 - **Layer 3: Compression/Streaming** - Optional transport wrappers (Not implemented yet)
 - **Layer 4: Client/Server** - Message-aware RPC with method dispatch (Not implemented yet)
@@ -39,10 +39,7 @@ xRPC follows a layered architecture:
 
 ### Planned Features
 
-- [ ] Network transports
-  - [x] TCP Transports
-  - [ ] UDP Transports
-  - [ ] Unix socket Transports
+- [x] Network transports (TCP, Unix socket) - removed UDP because rcp requires reliability
 - [ ] Examples for Transports
 - [ ] Compression wrapper for transports (integrating Message)
 - [ ] Streaming support

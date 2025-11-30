@@ -1,18 +1,20 @@
+#![cfg(unix)]
+
 use crate::error::{TransportError, TransportResult};
 use crate::transport::{Transport, TransportStats};
 use async_trait::async_trait;
 use bytes::Bytes;
-use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
-/// Configuration for TCP transport
+/// Configuration for Unix domain socket transport
 #[derive(Debug, Clone)]
-pub struct TcpConfig {
+pub struct UnixConfig {
     /// Maximum message size in bytes
     pub max_message_size: usize,
     /// Connection timeout
@@ -21,23 +23,20 @@ pub struct TcpConfig {
     pub read_timeout: Option<Duration>,
     /// Write timeout (None for no timeout)
     pub write_timeout: Option<Duration>,
-    /// Enable TCP_NODELAY (disable Nagle's algorithm)
-    pub nodelay: bool,
 }
 
-impl Default for TcpConfig {
+impl Default for UnixConfig {
     fn default() -> Self {
         Self {
             max_message_size: 16 * 1024 * 1024, // 16 MB
             connect_timeout: Duration::from_secs(5),
             read_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(30)),
-            nodelay: true,
         }
     }
 }
 
-impl TcpConfig {
+impl UnixConfig {
     /// Create a new configuration with custom max message size
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
@@ -61,84 +60,58 @@ impl TcpConfig {
         self.write_timeout = timeout;
         self
     }
-
-    /// Enable or disable TCP_NODELAY
-    pub fn with_nodelay(mut self, nodelay: bool) -> Self {
-        self.nodelay = nodelay;
-        self
-    }
 }
 
-/// TCP transport for network-based RPC communication
+/// Unix domain socket transport for local IPC
 #[derive(Debug)]
-pub struct TcpTransport {
-    config: TcpConfig,
-    stream: Arc<Mutex<TcpStream>>,
-    peer_addr: SocketAddr,
+pub struct UnixSocketTransport {
+    config: UnixConfig,
+    stream: Arc<Mutex<UnixStream>>,
+    path: PathBuf,
     connected: Arc<AtomicBool>,
     stats: Arc<Mutex<TransportStats>>,
 }
 
-impl TcpTransport {
-    /// Create a new TCP transport by connecting to an address
-    pub async fn connect(addr: SocketAddr, config: TcpConfig) -> TransportResult<Self> {
-        let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr))
+impl UnixSocketTransport {
+    /// Create a new Unix socket transport by connecting to a path
+    pub async fn connect<P: AsRef<Path>>(path: P, config: UnixConfig) -> TransportResult<Self> {
+        let path = path.as_ref().to_path_buf();
+
+        let stream = tokio::time::timeout(config.connect_timeout, UnixStream::connect(&path))
             .await
             .map_err(|_| TransportError::Timeout {
                 duration_ms: config.connect_timeout.as_millis() as u64,
-                operation: format!("connecting to {}", addr),
+                operation: format!("connecting to {:?}", path),
             })?
             .map_err(|e| TransportError::ConnectionFailed {
-                name: addr.to_string(),
+                name: path.display().to_string(),
                 attempts: 1,
                 reason: e.to_string(),
             })?;
 
-        // Disable Nagle's algorithm for lower latency
-        if config.nodelay {
-            stream.set_nodelay(true).map_err(|e| {
-                TransportError::Protocol(format!("Failed to set TCP_NODELAY: {}", e))
-            })?;
-        }
-
-        let peer_addr = stream
-            .peer_addr()
-            .map_err(|e| TransportError::Protocol(format!("Failed to get peer address: {}", e)))?;
-
         Ok(Self {
             config,
             stream: Arc::new(Mutex::new(stream)),
-            peer_addr,
+            path,
             connected: Arc::new(AtomicBool::new(true)),
             stats: Arc::new(Mutex::new(TransportStats::default())),
         })
     }
 
-    /// Create a new TCP transport from an existing stream
-    pub fn from_stream(stream: TcpStream, config: TcpConfig) -> TransportResult<Self> {
-        let peer_addr = stream
-            .peer_addr()
-            .map_err(|e| TransportError::Protocol(format!("Failed to get peer address: {}", e)))?;
-
-        // Disable Nagle's algorithm for lower latency
-        if config.nodelay {
-            stream.set_nodelay(true).map_err(|e| {
-                TransportError::Protocol(format!("Failed to set TCP_NODELAY: {}", e))
-            })?;
-        }
-
-        Ok(Self {
+    /// Create a new Unix socket transport from an existing stream
+    pub fn from_stream<P: AsRef<Path>>(stream: UnixStream, path: P, config: UnixConfig) -> Self {
+        Self {
             config,
             stream: Arc::new(Mutex::new(stream)),
-            peer_addr,
+            path: path.as_ref().to_path_buf(),
             connected: Arc::new(AtomicBool::new(true)),
             stats: Arc::new(Mutex::new(TransportStats::default())),
-        })
+        }
     }
 
-    /// Get the peer address
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+    /// Get the socket path
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Send raw bytes with length prefix
@@ -186,7 +159,7 @@ impl TcpTransport {
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "TCP write".to_string(),
+                    operation: "Unix socket write".to_string(),
                 })??;
         } else {
             write_op.await?;
@@ -227,7 +200,7 @@ impl TcpTransport {
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "TCP read length".to_string(),
+                    operation: "Unix socket read length".to_string(),
                 })??;
         } else {
             read_len_op.await?;
@@ -263,7 +236,7 @@ impl TcpTransport {
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "TCP read data".to_string(),
+                    operation: "Unix socket read data".to_string(),
                 })??;
         } else {
             read_data_op.await?;
@@ -279,7 +252,7 @@ impl TcpTransport {
 }
 
 #[async_trait]
-impl Transport for TcpTransport {
+impl Transport for UnixSocketTransport {
     async fn send(&self, data: &[u8]) -> TransportResult<()> {
         self.send_bytes(data).await
     }
@@ -315,71 +288,100 @@ impl Transport for TcpTransport {
     }
 
     fn name(&self) -> &str {
-        "tcp"
+        "unix"
     }
 }
 
-/// TCP listener for accepting incoming connections
-pub struct TcpTransportListener {
-    listener: TcpListener,
-    config: TcpConfig,
+/// Unix domain socket listener for accepting incoming connections
+pub struct UnixSocketListener {
+    listener: UnixListener,
+    config: UnixConfig,
+    path: PathBuf,
 }
 
-impl TcpTransportListener {
-    /// Bind to a socket address and listen for incoming connections
-    pub async fn bind(addr: SocketAddr, config: TcpConfig) -> TransportResult<Self> {
-        let listener =
-            TcpListener::bind(addr)
-                .await
-                .map_err(|e| TransportError::ConnectionFailed {
-                    name: addr.to_string(),
-                    attempts: 1,
-                    reason: format!("Failed to bind: {}", e),
-                })?;
+impl UnixSocketListener {
+    /// Bind to a Unix socket path and listen for incoming connections
+    pub async fn bind<P: AsRef<Path>>(path: P, config: UnixConfig) -> TransportResult<Self> {
+        let path = path.as_ref().to_path_buf();
 
-        Ok(Self { listener, config })
+        // Remove the socket file if it already exists
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| TransportError::ConnectionFailed {
+                name: path.display().to_string(),
+                attempts: 1,
+                reason: format!("Failed to remove existing socket file: {}", e),
+            })?;
+        }
+
+        let listener = UnixListener::bind(&path).map_err(|e| TransportError::ConnectionFailed {
+            name: path.display().to_string(),
+            attempts: 1,
+            reason: format!("Failed to bind: {}", e),
+        })?;
+
+        Ok(Self {
+            listener,
+            config,
+            path,
+        })
     }
 
-    /// Get the local address the listener is bound to
-    pub fn local_addr(&self) -> TransportResult<SocketAddr> {
-        self.listener
-            .local_addr()
-            .map_err(|e| TransportError::Protocol(format!("Failed to get local address: {}", e)))
+    /// Get the socket path
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Accept an incoming connection
-    pub async fn accept(&self) -> TransportResult<TcpTransport> {
+    pub async fn accept(&self) -> TransportResult<UnixSocketTransport> {
         let (stream, _addr) =
             self.listener
                 .accept()
                 .await
                 .map_err(|e| TransportError::ConnectionFailed {
-                    name: "tcp_listener".to_string(),
+                    name: "unix_listener".to_string(),
                     attempts: 1,
                     reason: format!("Failed to accept connection: {}", e),
                 })?;
 
-        TcpTransport::from_stream(stream, self.config.clone())
+        Ok(UnixSocketTransport::from_stream(
+            stream,
+            &self.path,
+            self.config.clone(),
+        ))
+    }
+}
+
+impl Drop for UnixSocketListener {
+    fn drop(&mut self) {
+        // Clean up the socket file
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
 
-    #[tokio::test]
-    async fn test_tcp_transport_connection() {
-        let config = TcpConfig::default();
+    fn temp_socket_path(name: &str) -> PathBuf {
+        let mut path = env::temp_dir();
+        path.push(format!("xrpc_test_{}_{}.sock", name, std::process::id()));
+        path
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unix_transport_connection() {
+        let socket_path = temp_socket_path("connection");
+        let config = UnixConfig::default();
 
         // Start a listener
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+        let listener = UnixSocketListener::bind(&socket_path, config.clone())
             .await
             .unwrap();
 
-        let addr = listener.local_addr().unwrap();
-
         // Connect a client
-        let client = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let client =
+            tokio::spawn(async move { UnixSocketTransport::connect(&socket_path, config).await });
 
         // Accept the connection
         let server = listener.accept().await.unwrap();
@@ -390,25 +392,28 @@ mod tests {
         assert!(server.is_connected());
     }
 
-    #[tokio::test]
-    async fn test_tcp_send_recv() {
-        let config = TcpConfig::default();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unix_send_recv() {
+        let socket_path = temp_socket_path("send_recv");
+        let config = UnixConfig::default();
 
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+        let listener = UnixSocketListener::bind(&socket_path, config.clone())
             .await
             .unwrap();
 
-        let addr = listener.local_addr().unwrap();
-
         // Connect a client
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let socket_path_clone = socket_path.clone();
+        let client_task =
+            tokio::spawn(
+                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+            );
 
         // Accept the connection
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
         // Send from client to server
-        let test_data = b"Hello, TCP!";
+        let test_data = b"Hello, Unix!";
         client.send(test_data).await.unwrap();
 
         let received = server.recv().await.unwrap();
@@ -423,16 +428,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_tcp_stats() {
-        let config = TcpConfig::default();
+    async fn test_unix_stats() {
+        let socket_path = temp_socket_path("stats");
+        let config = UnixConfig::default();
 
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+        let listener = UnixSocketListener::bind(&socket_path, config.clone())
             .await
             .unwrap();
 
-        let addr = listener.local_addr().unwrap();
-
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let socket_path_clone = socket_path.clone();
+        let client_task =
+            tokio::spawn(
+                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+            );
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
@@ -452,41 +460,59 @@ mod tests {
         assert!(server_stats.bytes_received > test_data.len() as u64);
     }
 
-    #[tokio::test]
-    async fn test_tcp_large_message() {
-        let config = TcpConfig::default();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unix_large_message() {
+        let socket_path = temp_socket_path("large");
+        let config = UnixConfig::default();
 
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+        let listener = UnixSocketListener::bind(&socket_path, config.clone())
             .await
             .unwrap();
 
-        let addr = listener.local_addr().unwrap();
-
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let socket_path_clone = socket_path.clone();
+        let client_task =
+            tokio::spawn(
+                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+            );
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
         // Send a large message (1 MB)
         let large_data = vec![0xAB; 1024 * 1024];
+
+        let server_task = tokio::spawn({
+            let server = server;
+            let expected = large_data.clone();
+            async move {
+                let received = server.recv().await.unwrap();
+                assert_eq!(received.len(), expected.len());
+                assert_eq!(received.as_ref(), expected.as_slice());
+            }
+        });
+
         client.send(&large_data).await.unwrap();
 
-        let received = server.recv().await.unwrap();
-        assert_eq!(received.len(), large_data.len());
-        assert_eq!(received.as_ref(), large_data.as_slice());
+        server_task.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn test_tcp_message_too_large() {
-        let config = TcpConfig::default().with_max_message_size(1024);
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unix_message_too_large() {
+        let socket_path = temp_socket_path("too_large");
+        let config = UnixConfig::default().with_max_message_size(1024);
 
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+        let listener = UnixSocketListener::bind(&socket_path, config.clone())
             .await
             .unwrap();
 
-        let addr = listener.local_addr().unwrap();
+        let socket_path_clone = socket_path.clone();
+        let client_task =
+            tokio::spawn(
+                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+            );
 
-        let client = TcpTransport::connect(addr, config).await.unwrap();
+        let _server = listener.accept().await.unwrap();
+        let client = client_task.await.unwrap().unwrap();
 
         // Try to send a message larger than the limit
         let large_data = vec![0; 2048];

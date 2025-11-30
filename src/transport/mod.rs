@@ -11,6 +11,9 @@ pub mod shared_memory;
 pub mod tcp;
 pub mod utils;
 
+#[cfg(unix)]
+pub mod unix;
+
 pub use utils::spawn_weak_loop;
 
 /// Transport trait for abstracting communication mechanisms

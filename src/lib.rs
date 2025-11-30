@@ -15,3 +15,6 @@ pub use transport::shared_memory::{RetryPolicy, SharedMemoryConfig, SharedMemory
 pub use transport::tcp::{TcpConfig, TcpTransport, TcpTransportListener};
 pub use transport::{Transport, TransportStats, spawn_weak_loop};
 pub use typed_channel::TypedChannel;
+
+#[cfg(unix)]
+pub use transport::unix::{UnixConfig, UnixSocketListener, UnixSocketTransport};

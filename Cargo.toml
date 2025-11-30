@@ -1,6 +1,6 @@
 [package]
 name = "xrpc-rs"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 description = "async RPC library optimized for shared memory communication"
