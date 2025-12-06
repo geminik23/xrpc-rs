@@ -11,6 +11,7 @@ pub use message::types::{MessageId, MessageType};
 pub use transport::arc::ArcTransport;
 pub use transport::channel::{ChannelConfig, ChannelTransport};
 pub use transport::direct::RawTransport;
+pub use transport::message_transport::{MessageTransport, MessageTransportAdapter};
 pub use transport::shared_memory::{RetryPolicy, SharedMemoryConfig, SharedMemoryTransport};
 pub use transport::tcp::{TcpConfig, TcpTransport, TcpTransportListener};
 pub use transport::{Transport, TransportStats, spawn_weak_loop};

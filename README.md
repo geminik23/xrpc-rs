@@ -10,10 +10,24 @@ This library provides efficient message passing with various transports includin
 
 xRPC follows a layered architecture:
 
-- **Layer 1: Transport** - Low-level byte transmission (TCP, Unix, SharedMemory, Channel)
-- **Layer 2: Message** - Protocol format with serialization/deserialization
-- **Layer 3: Compression/Streaming** - Optional transport wrappers (Not implemented yet)
-- **Layer 4: Client/Server** - Message-aware RPC with method dispatch (Not implemented yet)
+| Layer | Trait/Module | Description | Status |
+|-------|--------------|-------------|--------|
+| Layer 1 | `Transport` | Low-level byte transmission (TCP, Unix, SharedMemory, Channel) | completed |
+| Layer 2 | `MessageTransport` | Message-aware transport with compression | completed |
+| Layer 3 | `RpcClient/RpcServer` | RPC with method dispatch, streaming, request/response correlation | not implemented |
+| Layer 4 | Advanced | Batching, service discovery, load balancing | not impelmented |
+
+```
+Application
+    ↓
+RpcClient/RpcServer (Layer 3)
+    ↓
+MessageTransport (Layer 2) with compression
+    ↓
+Transport (Layer 1) raw bytes with framing
+    ↓
+Network/IPC
+```
 
 ## Documentation
 
@@ -39,12 +53,11 @@ xRPC follows a layered architecture:
 
 ### Planned Features
 
-- [x] Network transports (TCP, Unix socket) - removed UDP because rcp requires reliability
+- [x] Network transports (TCP, Unix socket)
+- [x] MessageTransport (Layer 2) - Message-aware transport adapter
 - [ ] Examples for Transports
-- [ ] Compression wrapper for transports (integrating Message)
 - [ ] Streaming support
-- [ ] Documentation for Transports
-- [ ] High-level Client/Server architecture
+- [ ] High-level Client/Server architecture (Layer 3)
 - [ ] Batching support
 - [ ] Service Discovery & Load Balancing
 

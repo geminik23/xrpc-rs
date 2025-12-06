@@ -7,6 +7,7 @@ use crate::error::TransportResult;
 pub mod arc;
 pub mod channel;
 pub mod direct;
+pub mod message_transport;
 pub mod shared_memory;
 pub mod tcp;
 pub mod utils;
@@ -14,6 +15,7 @@ pub mod utils;
 #[cfg(unix)]
 pub mod unix;
 
+pub use message_transport::{MessageTransport, MessageTransportAdapter};
 pub use utils::spawn_weak_loop;
 
 /// Transport trait for abstracting communication mechanisms
