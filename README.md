@@ -1,8 +1,8 @@
 # xRPC-rs
 
-Fast RPC library for Rust with multiple transport implementations.
+High-performance local IPC library for Rust with seamless transport flexibility.
 
-This library provides efficient message passing with various transports including in-process channels, shared memory for IPC, and planned support for network transports (TCP, etc.). While currently focused on local communication, the architecture is designed to support both local and remote RPC scenarios.
+Designed for multi-process applications on the same machine. Start with in-process channels for development, scale to shared memory for production IPC, and extend to TCP for network deployment—all with the same interface. 
 
 **Status:** Very early prototype - It is working but not production-ready.
 
@@ -33,6 +33,29 @@ Network/IPC
 
 - [Message Protocol](./docs/message.md) - Binary message format specification
 
+## Examples
+
+### Byte-level Transports
+
+Layer 1 transports (Channel, TCP, RawTransport, TypedChannel):
+
+```bash
+cargo run --example byte_transports
+```
+
+### MessageTransport with SharedMemory
+
+Local RPC using Message protocol over shared memory:
+
+```bash
+# Terminal 1: Start server
+cargo run --example message_transport_shm -- server
+
+# Terminal 2: Run client
+cargo run --example message_transport_shm -- client
+```
+
+
 ## Future Plans
 
 ### Completed
@@ -55,9 +78,9 @@ Network/IPC
 
 - [x] Network transports (TCP, Unix socket)
 - [x] MessageTransport (Layer 2) - Message-aware transport adapter
-- [ ] Examples for Transports
-- [ ] Streaming support
+- [x] Examples for Transports
 - [ ] High-level Client/Server architecture (Layer 3)
+- [ ] Streaming support
 - [ ] Batching support
 - [ ] Service Discovery & Load Balancing
 
