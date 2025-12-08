@@ -1,13 +1,17 @@
 //! xRPC-rs - Local RPC library using shared memory
+pub mod client;
 pub mod codec;
 pub mod error;
 pub mod message;
+pub mod server;
 pub mod transport;
 pub mod typed_channel;
 
+pub use client::{RpcClient, RpcClientHandle};
 pub use error::{Result, RpcError, TransportError, TransportResult};
 pub use message::Message;
 pub use message::types::{MessageId, MessageType};
+pub use server::{FnHandler, Handler, RpcServer, ServerHandle, TypedHandler};
 pub use transport::arc::ArcTransport;
 pub use transport::channel::{ChannelConfig, ChannelTransport};
 pub use transport::direct::RawTransport;

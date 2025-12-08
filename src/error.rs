@@ -7,6 +7,24 @@ pub enum RpcError {
 
     #[error("Invalid message: {0}")]
     InvalidMessage(String),
+
+    #[error("Method not found: {0}")]
+    MethodNotFound(String),
+
+    #[error("Request timeout: {0}")]
+    Timeout(String),
+
+    #[error("Server error: {0}")]
+    ServerError(String),
+
+    #[error("Client error: {0}")]
+    ClientError(String),
+
+    #[error("Transport error: {0}")]
+    Transport(#[from] TransportError),
+
+    #[error("Connection closed")]
+    ConnectionClosed,
 }
 
 #[derive(Error, Debug)]
