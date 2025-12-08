@@ -14,8 +14,8 @@ xRPC follows a layered architecture:
 |-------|--------------|-------------|--------|
 | Layer 1 | `Transport` | Low-level byte transmission (TCP, Unix, SharedMemory, Channel) | completed |
 | Layer 2 | `MessageTransport` | Message-aware transport with compression | completed |
-| Layer 3 | `RpcClient/RpcServer` | RPC with method dispatch, streaming, request/response correlation | not implemented |
-| Layer 4 | Advanced | Batching, service discovery, load balancing | not impelmented |
+| Layer 3 | `RpcClient/RpcServer` | RPC with method dispatch, streaming, request/response correlation | implementing |
+| Layer 4 | Advanced | Batching, service discovery, load balancing | not implemented |
 
 ```
 Application
@@ -55,6 +55,18 @@ cargo run --example message_transport_shm -- server
 cargo run --example message_transport_shm -- client
 ```
 
+### RPC Client/Server
+
+High-level RPC client and server with typed handlers:
+
+```bash
+# Terminal 1: Start server
+cargo run --example rpc_client_server -- server
+
+# Terminal 2: Run client
+cargo run --example rpc_client_server -- client
+```
+
 
 ## Future Plans
 
@@ -79,8 +91,9 @@ cargo run --example message_transport_shm -- client
 - [x] Network transports (TCP, Unix socket)
 - [x] MessageTransport (Layer 2) - Message-aware transport adapter
 - [x] Examples for Transports
-- [ ] High-level Client/Server architecture (Layer 3)
+- [x] High-level Client/Server architecture (Layer 3)
 - [ ] Streaming support
+- [ ] Connection pooling
 - [ ] Batching support
 - [ ] Service Discovery & Load Balancing
 
