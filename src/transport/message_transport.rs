@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use crate::codec::{BincodeCodec, Codec};
 use crate::error::TransportResult;
 use crate::message::Message;
 use crate::transport::{Transport, TransportStats};
 
 #[async_trait]
-pub trait MessageTransport: Send + Sync + Debug {
-    async fn send(&self, message: &Message) -> TransportResult<()>;
-    async fn recv(&self) -> TransportResult<Message>;
+pub trait MessageTransport<C: Codec = BincodeCodec>: Send + Sync + Debug {
+    async fn send(&self, message: &Message<C>) -> TransportResult<()>;
+    async fn recv(&self) -> TransportResult<Message<C>>;
     fn is_connected(&self) -> bool;
     fn is_healthy(&self) -> bool {
         self.is_connected()
@@ -21,13 +22,26 @@ pub trait MessageTransport: Send + Sync + Debug {
 }
 
 #[derive(Debug)]
-pub struct MessageTransportAdapter<T: Transport> {
+pub struct MessageTransportAdapter<T: Transport, C: Codec = BincodeCodec> {
     inner: T,
+    _codec: std::marker::PhantomData<C>,
 }
 
-impl<T: Transport> MessageTransportAdapter<T> {
+impl<T: Transport> MessageTransportAdapter<T, BincodeCodec> {
     pub fn new(transport: T) -> Self {
-        Self { inner: transport }
+        Self {
+            inner: transport,
+            _codec: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Transport, C: Codec> MessageTransportAdapter<T, C> {
+    pub fn with_codec(transport: T) -> Self {
+        Self {
+            inner: transport,
+            _codec: std::marker::PhantomData,
+        }
     }
 
     pub fn inner(&self) -> &T {
@@ -40,13 +54,13 @@ impl<T: Transport> MessageTransportAdapter<T> {
 }
 
 #[async_trait]
-impl<T: Transport> MessageTransport for MessageTransportAdapter<T> {
-    async fn send(&self, message: &Message) -> TransportResult<()> {
+impl<T: Transport, C: Codec + Default> MessageTransport<C> for MessageTransportAdapter<T, C> {
+    async fn send(&self, message: &Message<C>) -> TransportResult<()> {
         let bytes = message.encode()?;
         self.inner.send(&bytes).await
     }
 
-    async fn recv(&self) -> TransportResult<Message> {
+    async fn recv(&self) -> TransportResult<Message<C>> {
         let bytes = self.inner.recv().await?;
         Message::decode(bytes)
     }
@@ -69,12 +83,12 @@ impl<T: Transport> MessageTransport for MessageTransportAdapter<T> {
 }
 
 #[async_trait]
-impl<T: MessageTransport + ?Sized> MessageTransport for Arc<T> {
-    async fn send(&self, message: &Message) -> TransportResult<()> {
+impl<T: MessageTransport<C> + ?Sized, C: Codec + Default> MessageTransport<C> for Arc<T> {
+    async fn send(&self, message: &Message<C>) -> TransportResult<()> {
         (**self).send(message).await
     }
 
-    async fn recv(&self) -> TransportResult<Message> {
+    async fn recv(&self) -> TransportResult<Message<C>> {
         (**self).recv().await
     }
 
@@ -96,12 +110,12 @@ impl<T: MessageTransport + ?Sized> MessageTransport for Arc<T> {
 }
 
 #[async_trait]
-impl<T: MessageTransport + ?Sized> MessageTransport for Box<T> {
-    async fn send(&self, message: &Message) -> TransportResult<()> {
+impl<T: MessageTransport<C> + ?Sized, C: Codec + Default> MessageTransport<C> for Box<T> {
+    async fn send(&self, message: &Message<C>) -> TransportResult<()> {
         (**self).send(message).await
     }
 
-    async fn recv(&self) -> TransportResult<Message> {
+    async fn recv(&self) -> TransportResult<Message<C>> {
         (**self).recv().await
     }
 
@@ -148,7 +162,7 @@ mod tests {
         let mt2 = MessageTransportAdapter::new(t2);
 
         let req = TestRequest { value: 42 };
-        let call_msg = Message::call("test_method", req.clone()).unwrap();
+        let call_msg: Message = Message::call("test_method", req.clone()).unwrap();
         let msg_id = call_msg.id;
 
         mt1.send(&call_msg).await.unwrap();
@@ -164,7 +178,7 @@ mod tests {
         let resp = TestResponse {
             result: "ok".to_string(),
         };
-        let reply_msg = Message::reply(msg_id, resp.clone()).unwrap();
+        let reply_msg: Message = Message::reply(msg_id, resp.clone()).unwrap();
         mt2.send(&reply_msg).await.unwrap();
 
         let received_reply = mt1.recv().await.unwrap();
@@ -186,7 +200,7 @@ mod tests {
         let mt2 = MessageTransportAdapter::new(t2);
 
         let large_data = TestRequest { value: 12345 };
-        let mut msg = Message::call("compressed_method", large_data.clone()).unwrap();
+        let mut msg: Message = Message::call("compressed_method", large_data.clone()).unwrap();
         msg.metadata.compression = CompressionType::Lz4;
 
         mt1.send(&msg).await.unwrap();

@@ -23,6 +23,9 @@ pub enum RpcError {
     #[error("Transport error: {0}")]
     Transport(#[from] TransportError),
 
+    #[error("Stream error: {0}")]
+    StreamError(String),
+
     #[error("Connection closed")]
     ConnectionClosed,
 }
