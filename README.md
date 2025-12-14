@@ -92,8 +92,7 @@ cargo run --example rpc_client_server -- client
 - [x] MessageTransport (Layer 2) - Message-aware transport adapter
 - [x] Examples for Transports
 - [x] High-level Client/Server architecture (Layer 3)
-- [x] Streaming support
-- [ ] Connection pooling
+- [x] Streaming, pooling support
 - [ ] Batching support
 - [ ] Service Discovery & Load Balancing
 

@@ -13,6 +13,7 @@ pub use codec::{BincodeCodec, Codec, JsonCodec};
 pub use error::{Result, RpcError, TransportError, TransportResult};
 pub use message::Message;
 pub use message::types::{MessageId, MessageType};
+pub use pool::{ConnectionPool, PoolConfig, PoolGuard};
 pub use server::{
     FnHandler, FnStreamHandler, Handler, RpcServer, ServerHandle, ServerStreamSender,
     StreamHandler, TypedHandler, TypedStreamHandler,
