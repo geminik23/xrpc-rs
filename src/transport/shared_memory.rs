@@ -46,26 +46,28 @@ impl SharedMemoryControlBlock {
     }
 
     fn available_write(&self) -> usize {
-        let w = self.write_pos.load(Ordering::Acquire);
-        let r = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire) as usize;
+        let r = self.read_pos.load(Ordering::Acquire) as usize;
         let cap = self.capacity.load(Ordering::Acquire) as usize;
-
-        if w >= r {
-            cap - (w - r) as usize - 1
+        let w_norm = w % cap;
+        let r_norm = r % cap;
+        if w_norm >= r_norm {
+            cap - (w_norm - r_norm) - 1
         } else {
-            (r - w) as usize - 1
+            (r_norm - w_norm) - 1
         }
     }
 
     fn available_read(&self) -> usize {
-        let w = self.write_pos.load(Ordering::Acquire);
-        let r = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire) as usize;
+        let r = self.read_pos.load(Ordering::Acquire) as usize;
         let cap = self.capacity.load(Ordering::Acquire) as usize;
-
-        if w >= r {
-            (w - r) as usize
+        let w_norm = w % cap;
+        let r_norm = r % cap;
+        if w_norm >= r_norm {
+            w_norm - r_norm
         } else {
-            cap - (r - w) as usize
+            cap - (r_norm - w_norm)
         }
     }
 
@@ -852,5 +854,31 @@ mod tests {
         client.send(b"Hello").await.unwrap();
         let msg = server.recv().await.unwrap();
         assert_eq!(msg.as_ref(), b"Hello");
+    }
+
+    #[tokio::test]
+    async fn test_ring_buffer_wrapping() {
+        let config = SharedMemoryConfig::default().with_buffer_size(8192);
+        let server = SharedMemoryTransport::create_server("test-wrap", config).unwrap();
+        let client = SharedMemoryTransport::connect_client("test-wrap").unwrap();
+
+        let chunk_size = 1000;
+        let num_chunks = 20;
+
+        // Send 20KB total buffer is 8KB
+        let send_handle = tokio::spawn(async move {
+            for i in 0..num_chunks {
+                let data = vec![i as u8; chunk_size];
+                client.send(&data).await.unwrap();
+            }
+        });
+
+        for i in 0..num_chunks {
+            let msg = server.recv().await.unwrap();
+            assert_eq!(msg.len(), chunk_size);
+            assert!(msg.iter().all(|&b| b == i as u8), "chunk {} corrupted", i);
+        }
+
+        send_handle.await.unwrap();
     }
 }
