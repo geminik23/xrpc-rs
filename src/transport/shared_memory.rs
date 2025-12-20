@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -565,8 +566,9 @@ impl SharedMemoryConfig {
 
 #[derive(Debug)]
 pub struct SharedMemoryTransport {
-    send_buffer: Arc<SharedMemoryRingBuffer>,
-    recv_buffer: Arc<SharedMemoryRingBuffer>,
+    // ArcSwap allows lock-free reads with occasional swap on reconnect
+    send_buffer: ArcSwap<SharedMemoryRingBuffer>,
+    recv_buffer: ArcSwap<SharedMemoryRingBuffer>,
     config: SharedMemoryConfig,
     stats: Arc<Mutex<TransportStats>>,
     name: String,
@@ -604,8 +606,8 @@ impl SharedMemoryTransport {
         );
 
         Ok(Self {
-            send_buffer,
-            recv_buffer,
+            send_buffer: ArcSwap::new(send_buffer),
+            recv_buffer: ArcSwap::new(recv_buffer),
             config,
             stats: Arc::new(Mutex::new(TransportStats::default())),
             name: format!("{}-server", name),
@@ -647,8 +649,8 @@ impl SharedMemoryTransport {
                     );
 
                     return Ok(Self {
-                        send_buffer: send_arc,
-                        recv_buffer: recv_arc,
+                        send_buffer: ArcSwap::new(send_arc),
+                        recv_buffer: ArcSwap::new(recv_arc),
                         config: config.clone(),
                         stats: Arc::new(Mutex::new(TransportStats::default())),
                         name: format!("{}-client", name),
@@ -694,10 +696,12 @@ impl SharedMemoryTransport {
                 SharedMemoryRingBuffer::connect(&send_name),
                 SharedMemoryRingBuffer::connect(&recv_name),
             ) {
-                (Ok(_send), Ok(_recv)) => {
-                    self.connected.store(true, Ordering::Release);
-                    // Reset error count on successful reconnect
+                (Ok(send), Ok(recv)) => {
+                    // Atomic swap with newly connected buffers
+                    self.send_buffer.store(Arc::new(send));
+                    self.recv_buffer.store(Arc::new(recv));
                     *self.error_count.lock() = 0;
+                    self.connected.store(true, Ordering::Release);
                     return Ok(());
                 }
                 _ => continue,
@@ -712,7 +716,8 @@ impl SharedMemoryTransport {
     }
 
     pub fn is_healthy(&self) -> bool {
-        let control = unsafe { &*self.recv_buffer.control };
+        let recv_buf = self.recv_buffer.load();
+        let control = unsafe { &*recv_buf.control };
         control.is_healthy(30) && *self.error_count.lock() < 10
     }
 
@@ -741,7 +746,7 @@ impl Transport for SharedMemoryTransport {
             }
 
             let result = tokio::task::spawn_blocking({
-                let buffer = self.send_buffer.clone();
+                let buffer = self.send_buffer.load_full();
                 let data = data.to_vec();
                 move || buffer.write(&data)
             })
@@ -789,7 +794,7 @@ impl Transport for SharedMemoryTransport {
             }
 
             let result = tokio::task::spawn_blocking({
-                let buffer = self.recv_buffer.clone();
+                let buffer = self.recv_buffer.load_full();
                 move || buffer.read()
             })
             .await;
@@ -827,7 +832,8 @@ impl Transport for SharedMemoryTransport {
     }
 
     async fn close(&self) -> TransportResult<()> {
-        let control = unsafe { &*self.send_buffer.control };
+        let send_buf = self.send_buffer.load();
+        let control = unsafe { &*send_buf.control };
         control.connected.store(false, Ordering::Release);
         Ok(())
     }
@@ -880,5 +886,30 @@ mod tests {
         }
 
         send_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_auto_reconnect() {
+        let config = SharedMemoryConfig::default().with_auto_reconnect(true);
+        let server =
+            SharedMemoryTransport::create_server("test-reconnect", config.clone()).unwrap();
+        let client =
+            SharedMemoryTransport::connect_client_with_config("test-reconnect", config).unwrap();
+
+        // Verify initial connection works
+        client.send(b"before").await.unwrap();
+        let msg = server.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"before");
+
+        // Simulate disconnect by marking client as disconnected
+        client.connected.store(false, Ordering::Release);
+        assert!(!client.is_connected());
+
+        // Next send should trigger reconnect and succeed
+        client.send(b"after").await.unwrap();
+        assert!(client.is_connected());
+
+        let msg = server.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"after");
     }
 }
