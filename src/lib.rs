@@ -9,6 +9,12 @@ pub mod transport;
 pub mod typed_channel;
 
 pub use client::{RpcClient, RpcClientHandle};
+#[cfg(feature = "codec-cbor")]
+pub use codec::CborCodec;
+#[cfg(feature = "codec-messagepack")]
+pub use codec::MessagePackCodec;
+#[cfg(feature = "codec-postcard")]
+pub use codec::PostcardCodec;
 pub use codec::{BincodeCodec, Codec, JsonCodec};
 pub use error::{Result, RpcError, TransportError, TransportResult};
 pub use message::Message;

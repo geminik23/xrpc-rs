@@ -12,7 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batching support
 - Service Discovery & Load Balancing
 
-## [0.1.12] - 2025-01-20
+## [0.1.12] - 2025-12-20
+
+### Added
+
+- `MessagePackCodec` (feature: `codec-messagepack`)
+- `CborCodec` (feature: `codec-cbor`)
+- `PostcardCodec` (feature: `codec-postcard`)
 
 ### Fixed
 
@@ -29,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streams assume ordered transport (removed unused reordering buffer)
 
 
-## [0.1.0] - 2025-01-01
+## [0.1.10] - 2025-12-13
 
 Initial release with core functionality.
 

@@ -37,3 +37,57 @@ impl Codec for JsonCodec {
         Ok(serde_json::from_slice(data)?)
     }
 }
+
+/// MessagePack codec - compact binary, cross-language compatible
+#[cfg(feature = "codec-messagepack")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessagePackCodec;
+
+#[cfg(feature = "codec-messagepack")]
+impl Codec for MessagePackCodec {
+    fn encode<T: Serialize>(&self, data: &T) -> Result<Vec<u8>> {
+        rmp_serde::to_vec(data).map_err(|e| crate::error::RpcError::Serialization(e.to_string()))
+    }
+
+    fn decode<T: for<'de> Deserialize<'de>>(&self, data: &[u8]) -> Result<T> {
+        rmp_serde::from_slice(data)
+            .map_err(|e| crate::error::RpcError::Serialization(e.to_string()))
+    }
+}
+
+/// CBOR codec - binary JSON (RFC 8949), self-describing
+#[cfg(feature = "codec-cbor")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CborCodec;
+
+#[cfg(feature = "codec-cbor")]
+impl Codec for CborCodec {
+    fn encode<T: Serialize>(&self, data: &T) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        ciborium::into_writer(data, &mut buf)
+            .map_err(|e| crate::error::RpcError::Serialization(e.to_string()))?;
+        Ok(buf)
+    }
+
+    fn decode<T: for<'de> Deserialize<'de>>(&self, data: &[u8]) -> Result<T> {
+        ciborium::from_reader(data)
+            .map_err(|e| crate::error::RpcError::Serialization(e.to_string()))
+    }
+}
+
+/// Postcard codec - minimal binary, no_std compatible
+#[cfg(feature = "codec-postcard")]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PostcardCodec;
+
+#[cfg(feature = "codec-postcard")]
+impl Codec for PostcardCodec {
+    fn encode<T: Serialize>(&self, data: &T) -> Result<Vec<u8>> {
+        postcard::to_allocvec(data)
+            .map_err(|e| crate::error::RpcError::Serialization(e.to_string()))
+    }
+
+    fn decode<T: for<'de> Deserialize<'de>>(&self, data: &[u8]) -> Result<T> {
+        postcard::from_bytes(data).map_err(|e| crate::error::RpcError::Serialization(e.to_string()))
+    }
+}

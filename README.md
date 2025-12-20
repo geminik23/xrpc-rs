@@ -33,6 +33,9 @@ let resp: AddResponse = client.call("add", &AddRequest { a: 1, b: 2 }).await?;
 ```toml
 [dependencies]
 xrpc-rs = "0.1"
+
+# Optional codecs: codec-messagepack, codec-cbor, codec-postcard, codec-all
+xrpc-rs = { version = "0.1", features = ["codec-messagepack"] }
 ```
 
 ## Status
