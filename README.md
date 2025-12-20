@@ -13,37 +13,55 @@ Start with in-process channels for development, scale to shared memory for produ
 ## Quick Start
 
 ```rust
-use xrpc::{RpcClient, RpcServer, MessageTransportAdapter, SharedMemoryTransport};
+use xrpc::{
+    RpcClient, RpcServer, MessageChannelAdapter,
+    SharedMemoryFrameTransport, SharedMemoryConfig,
+};
+use serde::{Serialize, Deserialize};
+use std::sync::Arc;
 
-// Server
+#[derive(Serialize, Deserialize)]
+struct AddRequest { a: i32, b: i32 }
+
+#[derive(Serialize, Deserialize)]
+struct AddResponse { result: i32 }
+
+// =================== Server
+let transport = SharedMemoryFrameTransport::create_server("my_service", SharedMemoryConfig::default())?;
+let channel = Arc::new(MessageChannelAdapter::new(transport));
+
 let server = RpcServer::new();
 server.register_typed("add", |req: AddRequest| async move {
     Ok(AddResponse { result: req.a + req.b })
 });
-server.serve(transport).await?;
+server.serve(channel).await?;
 
-// Client  
-let client = RpcClient::new(transport);
+// =================== Client
+let transport = SharedMemoryFrameTransport::connect_client("my_service")?;
+let channel = MessageChannelAdapter::new(transport);
+
+let client = RpcClient::new(channel);
 let _handle = client.start();
 let resp: AddResponse = client.call("add", &AddRequest { a: 1, b: 2 }).await?;
+assert_eq!(resp.result, 3);
 ```
 
 ## Installation
 
 ```toml
 [dependencies]
-xrpc-rs = "0.1"
+xrpc-rs = "0.2"
 
 # Optional codecs: codec-messagepack, codec-cbor, codec-postcard, codec-all
-xrpc-rs = { version = "0.1", features = ["codec-messagepack"] }
+xrpc-rs = { version = "0.2", features = ["codec-messagepack"] }
 ```
 
 ## Status
 
 | Feature | Status |
 |---------|--------|
-| Transport Layer (TCP, Unix, SharedMemory, Channel) | Completed |
-| MessageTransport with compression | Completed |
+| FrameTransport Layer (TCP, Unix, SharedMemory, Channel) | Completed |
+| MessageChannel with compression | Completed |
 | RPC Client/Server | Completed |
 | Streaming | Completed |
 | Connection Pooling | Completed |
@@ -56,8 +74,8 @@ xRPC follows a layered architecture:
 
 | Layer | Trait/Module | Description |
 |-------|--------------|-------------|
-| Layer 1 | `Transport` | Low-level byte transmission |
-| Layer 2 | `MessageTransport` | Message-aware transport with compression |
+| Layer 1 | `FrameTransport` | Low-level byte transmission with framing |
+| Layer 2 | `MessageChannel` | Message-aware channel with compression |
 | Layer 3 | `RpcClient/RpcServer` | RPC with method dispatch, streaming |
 | Layer 4 | Advanced | Batching, service discovery, load balancing |
 
@@ -66,9 +84,9 @@ Application
     ↓
 RpcClient/RpcServer (Layer 3)
     ↓
-MessageTransport (Layer 2)
+MessageChannel (Layer 2)
     ↓
-Transport (Layer 1)
+FrameTransport (Layer 1)
     ↓
 Network/IPC
 ```
@@ -77,11 +95,11 @@ Network/IPC
 
 | Transport | Use Case | Cross-Process | Serialization |
 |-----------|----------|---------------|---------------|
-| `SharedMemoryTransport` | Production IPC | Yes | Yes |
-| `TcpTransport` | Network / Remote | Yes | Yes |
-| `UnixSocketTransport` | Local IPC (Unix) | Yes | Yes |
-| `ChannelTransport` | Same-process / Testing | No | Yes |
-| `ArcTransport` | Same-process fast path | No | No (zero-copy) |
+| `SharedMemoryFrameTransport` | Production IPC | Yes | Yes |
+| `TcpFrameTransport` | Network / Remote | Yes | Yes |
+| `UnixFrameTransport` | Local IPC (Unix) | Yes | Yes |
+| `ChannelFrameTransport` | Same-process / Testing | No | Yes |
+| `ArcFrameTransport` | Same-process fast path | No | No (zero-copy) |
 
 ## Documentation
 

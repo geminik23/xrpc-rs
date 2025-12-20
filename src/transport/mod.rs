@@ -6,8 +6,6 @@ use crate::error::TransportResult;
 
 pub mod arc;
 pub mod channel;
-pub mod direct;
-pub mod message_transport;
 pub mod shared_memory;
 pub mod tcp;
 pub mod utils;
@@ -15,41 +13,40 @@ pub mod utils;
 #[cfg(unix)]
 pub mod unix;
 
-pub use message_transport::{MessageTransport, MessageTransportAdapter};
 pub use utils::spawn_weak_loop;
 
-/// Transport trait for abstracting communication mechanisms
+/// Low-level byte transport with framing support (Layer 1).
 #[async_trait]
-pub trait Transport: Send + Sync + Debug {
-    /// Send data through the transport
-    async fn send(&self, data: &[u8]) -> TransportResult<()>;
+pub trait FrameTransport: Send + Sync + Debug {
+    /// Send a frame of bytes.
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()>;
 
-    /// Receive data from the transport
-    async fn recv(&self) -> TransportResult<Bytes>;
+    /// Receive a frame of bytes.
+    async fn recv_frame(&self) -> TransportResult<Bytes>;
 
-    /// Check if the transport is connected
+    /// Check if the transport is connected.
     fn is_connected(&self) -> bool;
 
-    /// Check if the transport is healthy
+    /// Check if the transport is healthy.
     fn is_healthy(&self) -> bool {
         true
     }
 
-    /// Close the transport
+    /// Close the transport connection.
     async fn close(&self) -> TransportResult<()>;
 
-    /// Get transport statistics
+    /// Get transport statistics.
     fn stats(&self) -> Option<TransportStats> {
         None
     }
 
-    /// Get transport name/identifier
+    /// Get transport name/identifier.
     fn name(&self) -> &str {
         "unknown"
     }
 }
 
-/// Statistics collected by transport implementations
+/// Statistics collected by transport implementations.
 #[derive(Debug, Clone, Default)]
 pub struct TransportStats {
     pub messages_sent: u64,
@@ -101,13 +98,13 @@ impl std::fmt::Display for TransportStats {
 }
 
 #[async_trait]
-impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
-        (**self).send(data).await
+impl<T: FrameTransport + ?Sized> FrameTransport for std::sync::Arc<T> {
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
+        (**self).send_frame(data).await
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
-        (**self).recv().await
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
+        (**self).recv_frame().await
     }
 
     fn is_connected(&self) -> bool {
@@ -132,13 +129,13 @@ impl<T: Transport + ?Sized> Transport for std::sync::Arc<T> {
 }
 
 #[async_trait]
-impl<T: Transport + ?Sized> Transport for Box<T> {
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
-        (**self).send(data).await
+impl<T: FrameTransport + ?Sized> FrameTransport for Box<T> {
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
+        (**self).send_frame(data).await
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
-        (**self).recv().await
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
+        (**self).recv_frame().await
     }
 
     fn is_connected(&self) -> bool {
@@ -161,3 +158,10 @@ impl<T: Transport + ?Sized> Transport for Box<T> {
         (**self).name()
     }
 }
+
+// Deprecated alias for backward compatibility
+#[deprecated(since = "0.2.0", note = "Use FrameTransport instead")]
+pub trait Transport: FrameTransport {}
+
+#[allow(deprecated)]
+impl<T: FrameTransport> Transport for T {}

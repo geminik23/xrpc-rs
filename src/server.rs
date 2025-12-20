@@ -8,13 +8,13 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::channel::message::MessageChannel;
 use crate::codec::{BincodeCodec, Codec};
 use crate::error::{Result, RpcError};
 use crate::message::Message;
 use crate::message::metadata::MessageMetadata;
 use crate::message::types::{MessageId, MessageType};
 use crate::streaming::{StreamId, next_stream_id};
-use crate::transport::message_transport::MessageTransport;
 
 #[async_trait]
 pub trait Handler<C: Codec>: Send + Sync {
@@ -344,7 +344,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         self.stream_handlers.write().insert(method, handler);
     }
 
-    pub async fn handle_message<T: MessageTransport<C>>(
+    pub async fn handle_message<T: MessageChannel<C>>(
         &self,
         message: Message<C>,
         transport: &T,
@@ -379,7 +379,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         }
     }
 
-    async fn handle_stream_call<T: MessageTransport<C>>(&self, message: Message<C>, transport: &T) {
+    async fn handle_stream_call<T: MessageChannel<C>>(&self, message: Message<C>, transport: &T) {
         let stream_id = message.metadata.stream_id.unwrap_or_else(next_stream_id);
         let handler = self.stream_handlers.read().get(&message.method).cloned();
 
@@ -415,7 +415,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         tokio::join!(handler_task, transport_send);
     }
 
-    pub async fn serve<T: MessageTransport<C>>(&self, transport: Arc<T>) -> Result<()> {
+    pub async fn serve<T: MessageChannel<C>>(&self, transport: Arc<T>) -> Result<()> {
         loop {
             let message = transport.recv().await.map_err(RpcError::Transport)?;
 
@@ -428,7 +428,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         }
     }
 
-    pub fn spawn_handler<T: MessageTransport<C> + 'static>(&self, transport: T) -> ServerHandle {
+    pub fn spawn_handler<T: MessageChannel<C> + 'static>(&self, transport: T) -> ServerHandle {
         let handlers = self.handlers.clone();
         let stream_handlers = self.stream_handlers.clone();
         let codec = self.codec.clone();
@@ -475,9 +475,9 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::message::MessageChannelAdapter;
     use crate::streaming::StreamReceiver;
-    use crate::transport::channel::{ChannelConfig, ChannelTransport};
-    use crate::transport::message_transport::MessageTransportAdapter;
+    use crate::transport::channel::{ChannelConfig, ChannelFrameTransport};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct AddRequest {
@@ -493,10 +493,10 @@ mod tests {
     #[tokio::test]
     async fn test_server_typed_handler() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = MessageTransportAdapter::new(t1);
-        let server_transport = MessageTransportAdapter::new(t2);
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
 
         let server = RpcServer::new();
         server.register_typed("add", |req: AddRequest| async move {
@@ -505,12 +505,12 @@ mod tests {
             })
         });
 
-        let _handle = server.spawn_handler(server_transport);
+        let _handle = server.spawn_handler(server_channel);
 
         let request: Message = Message::call("add", AddRequest { a: 10, b: 32 }).unwrap();
-        client_transport.send(&request).await.unwrap();
+        client_channel.send(&request).await.unwrap();
 
-        let response = client_transport.recv().await.unwrap();
+        let response = client_channel.recv().await.unwrap();
         assert_eq!(response.msg_type, MessageType::Reply);
 
         let resp: AddResponse = response.deserialize_payload().unwrap();
@@ -520,17 +520,17 @@ mod tests {
     #[tokio::test]
     async fn test_server_stream_handler() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = Arc::new(MessageTransportAdapter::new(t1));
-        let server_transport = MessageTransportAdapter::new(t2);
+        let client_channel = Arc::new(MessageChannelAdapter::new(t1));
+        let server_channel = MessageChannelAdapter::new(t2);
 
         let server = RpcServer::new();
         server.register_stream("range", |count: i32| {
             futures::stream::iter((1..=count).map(|i| Ok(i)))
         });
 
-        let _handle = server.spawn_handler(server_transport);
+        let _handle = server.spawn_handler(server_channel);
 
         let stream_id = next_stream_id();
         let mut request: Message = Message::call("range", 5i32).unwrap();
@@ -539,12 +539,12 @@ mod tests {
         let manager = crate::streaming::StreamManager::new();
         let mut receiver: StreamReceiver<i32> = manager.create_receiver(stream_id);
 
-        client_transport.send(&request).await.unwrap();
+        client_channel.send(&request).await.unwrap();
 
-        let client_transport_clone = client_transport.clone();
+        let client_channel_clone = client_channel.clone();
         let recv_task = tokio::spawn(async move {
             loop {
-                match client_transport_clone.recv().await {
+                match client_channel_clone.recv().await {
                     Ok(msg) => {
                         if msg.msg_type == MessageType::StreamEnd {
                             manager.handle_message(&msg);
@@ -571,10 +571,10 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = MessageTransportAdapter::new(t1);
-        let server_transport = MessageTransportAdapter::new(t2);
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
 
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
@@ -588,10 +588,10 @@ mod tests {
             }
         });
 
-        let _handle = server.spawn_handler(server_transport);
+        let _handle = server.spawn_handler(server_channel);
 
         let notification: Message = Message::notification("log", "test").unwrap();
-        client_transport.send(&notification).await.unwrap();
+        client_channel.send(&notification).await.unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(called.load(Ordering::Acquire));

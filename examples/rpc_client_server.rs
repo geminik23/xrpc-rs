@@ -1,8 +1,10 @@
+//! Example demonstrating RpcClient and RpcServer with SharedMemory transport.
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 use xrpc::{
-    MessageTransportAdapter, RpcClient, RpcServer, SharedMemoryConfig, SharedMemoryTransport,
+    MessageChannelAdapter, RpcClient, RpcServer, SharedMemoryConfig, SharedMemoryFrameTransport,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,8 +52,8 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Server] Starting RPC server");
 
     let config = SharedMemoryConfig::default();
-    let transport = SharedMemoryTransport::create_server(SERVICE_NAME, config)?;
-    let msg_transport = Arc::new(MessageTransportAdapter::new(transport));
+    let transport = SharedMemoryFrameTransport::create_server(SERVICE_NAME, config)?;
+    let channel = Arc::new(MessageChannelAdapter::new(transport));
 
     let server = RpcServer::new();
 
@@ -74,7 +76,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Server] Registered {} handlers", server.handler_count());
     println!("[Server] Waiting for requests\n");
 
-    server.serve(msg_transport).await?;
+    server.serve(channel).await?;
 
     Ok(())
 }
@@ -82,10 +84,10 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Client] Connecting to RPC server");
 
-    let transport = SharedMemoryTransport::connect_client(SERVICE_NAME)?;
-    let msg_transport = MessageTransportAdapter::new(transport);
+    let transport = SharedMemoryFrameTransport::connect_client(SERVICE_NAME)?;
+    let channel = MessageChannelAdapter::new(transport);
 
-    let client = RpcClient::new(msg_transport);
+    let client = RpcClient::new(channel);
     let _handle = client.start();
 
     println!("[Client] Connected!\n");

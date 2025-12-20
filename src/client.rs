@@ -7,16 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::oneshot;
 
+use crate::channel::message::MessageChannel;
 use crate::codec::{BincodeCodec, Codec};
 use crate::error::{Result, RpcError};
 use crate::message::Message;
 use crate::message::types::{MessageId, MessageType};
 use crate::streaming::{StreamManager, StreamReceiver, next_stream_id};
-use crate::transport::message_transport::MessageTransport;
 
+/// RPC client for making remote procedure calls.
 pub struct RpcClient<T, C: Codec = BincodeCodec>
 where
-    T: MessageTransport<C>,
+    T: MessageChannel<C>,
 {
     transport: Arc<T>,
     pending: Arc<Mutex<HashMap<MessageId, oneshot::Sender<Result<Message<C>>>>>>,
@@ -26,7 +27,7 @@ where
     default_timeout: Duration,
 }
 
-impl<T: MessageTransport<BincodeCodec> + 'static> RpcClient<T, BincodeCodec> {
+impl<T: MessageChannel<BincodeCodec> + 'static> RpcClient<T, BincodeCodec> {
     pub fn new(transport: T) -> Self {
         Self::with_timeout(transport, Duration::from_secs(30))
     }
@@ -45,7 +46,7 @@ impl<T: MessageTransport<BincodeCodec> + 'static> RpcClient<T, BincodeCodec> {
 
 impl<T, C> RpcClient<T, C>
 where
-    T: MessageTransport<C> + 'static,
+    T: MessageChannel<C> + 'static,
     C: Codec + Clone + Default + 'static,
 {
     pub fn with_codec(transport: T, codec: C) -> Self {
@@ -70,6 +71,7 @@ where
         }
     }
 
+    /// Start the client's background receive loop.
     pub fn start(&self) -> RpcClientHandle {
         self.running.store(true, Ordering::Release);
 
@@ -121,6 +123,7 @@ where
         self.stream_manager.clone()
     }
 
+    /// Make a typed RPC call.
     pub async fn call<Req, Resp>(&self, method: &str, request: &Req) -> Result<Resp>
     where
         Req: Serialize,
@@ -130,6 +133,7 @@ where
             .await
     }
 
+    /// Make a typed RPC call with custom timeout.
     pub async fn call_with_timeout<Req, Resp>(
         &self,
         method: &str,
@@ -175,6 +179,7 @@ where
         }
     }
 
+    /// Initiate a server streaming RPC call.
     pub async fn call_server_stream<Req, Resp>(
         &self,
         method: &str,
@@ -198,6 +203,7 @@ where
         Ok(receiver)
     }
 
+    /// Send a one-way notification (no response expected).
     pub async fn notify<Req: Serialize>(&self, method: &str, request: &Req) -> Result<()> {
         let message: Message<C> = Message::notification(method, request)?;
         self.transport
@@ -206,11 +212,13 @@ where
             .map_err(RpcError::Transport)
     }
 
+    /// Make a raw bytes RPC call.
     pub async fn call_raw(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
         self.call_raw_with_timeout(method, payload, self.default_timeout)
             .await
     }
 
+    /// Make a raw bytes RPC call with custom timeout.
     pub async fn call_raw_with_timeout(
         &self,
         method: &str,
@@ -274,7 +282,7 @@ where
 
 impl<T, C> Debug for RpcClient<T, C>
 where
-    T: MessageTransport<C>,
+    T: MessageChannel<C>,
     C: Codec + Clone,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -286,6 +294,7 @@ where
     }
 }
 
+/// Handle for the client's background task.
 pub struct RpcClientHandle {
     handle: tokio::task::JoinHandle<()>,
 }
@@ -300,8 +309,8 @@ impl RpcClientHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::channel::{ChannelConfig, ChannelTransport};
-    use crate::transport::message_transport::MessageTransportAdapter;
+    use crate::channel::message::MessageChannelAdapter;
+    use crate::transport::channel::{ChannelConfig, ChannelFrameTransport};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct AddRequest {
@@ -317,16 +326,16 @@ mod tests {
     #[tokio::test]
     async fn test_client_call_reply() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = MessageTransportAdapter::new(t1);
-        let server_transport = MessageTransportAdapter::new(t2);
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
 
-        let client = RpcClient::new(client_transport);
+        let client = RpcClient::new(client_channel);
         let _handle = client.start();
 
         let server_handle = tokio::spawn(async move {
-            let msg = server_transport.recv().await.unwrap();
+            let msg = server_channel.recv().await.unwrap();
             assert_eq!(msg.method, "add");
 
             let req: AddRequest = msg.deserialize_payload().unwrap();
@@ -335,7 +344,7 @@ mod tests {
             };
 
             let reply: Message = Message::reply(msg.id, resp).unwrap();
-            server_transport.send(&reply).await.unwrap();
+            server_channel.send(&reply).await.unwrap();
         });
 
         let response: AddResponse = client
@@ -350,26 +359,26 @@ mod tests {
     #[tokio::test]
     async fn test_client_server_stream() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = MessageTransportAdapter::new(t1);
-        let server_transport = Arc::new(MessageTransportAdapter::new(t2));
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = Arc::new(MessageChannelAdapter::new(t2));
 
-        let client = RpcClient::new(client_transport);
+        let client = RpcClient::new(client_channel);
         let _handle = client.start();
 
-        let server_transport_clone = server_transport.clone();
+        let server_channel_clone = server_channel.clone();
         let server_handle = tokio::spawn(async move {
-            let msg = server_transport_clone.recv().await.unwrap();
+            let msg = server_channel_clone.recv().await.unwrap();
             let stream_id = msg.metadata.stream_id.unwrap();
 
             for i in 1..=3 {
                 let chunk: Message = Message::stream_chunk(stream_id, i - 1, i as i32).unwrap();
-                server_transport_clone.send(&chunk).await.unwrap();
+                server_channel_clone.send(&chunk).await.unwrap();
             }
 
             let end: Message = Message::stream_end(stream_id);
-            server_transport_clone.send(&end).await.unwrap();
+            server_channel_clone.send(&end).await.unwrap();
         });
 
         let mut stream: StreamReceiver<i32> =
@@ -387,21 +396,20 @@ mod tests {
     #[tokio::test]
     async fn test_client_stream_error() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let client_transport = MessageTransportAdapter::new(t1);
-        let server_transport = MessageTransportAdapter::new(t2);
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
 
-        let client = RpcClient::new(client_transport);
+        let client = RpcClient::new(client_channel);
         let _handle = client.start();
 
-        // Server sends error with stream_id
         let server_handle = tokio::spawn(async move {
-            let msg = server_transport.recv().await.unwrap();
+            let msg = server_channel.recv().await.unwrap();
             let stream_id = msg.metadata.stream_id.unwrap();
 
             let error: Message = Message::stream_error(msg.id, stream_id, "method not found");
-            server_transport.send(&error).await.unwrap();
+            server_channel.send(&error).await.unwrap();
         });
 
         let mut stream: StreamReceiver<i32> = client
@@ -409,7 +417,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Should receive error, not hang
         let result = stream.recv().await;
         assert!(result.is_some());
         assert!(result.unwrap().is_err());

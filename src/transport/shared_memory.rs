@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::{TransportError, TransportResult};
 use crate::transport::utils::spawn_weak_loop;
-use crate::transport::{Transport, TransportStats};
+use crate::transport::{FrameTransport, TransportStats};
 
 const SHM_MAGIC: u64 = 0x58525043; // XRPC IN ASCII
 const MIN_BUFFER_SIZE: usize = 4096;
@@ -465,6 +465,7 @@ impl Drop for SharedMemoryRingBuffer {
     }
 }
 
+/// Retry policy for reconnection attempts.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum RetryPolicy {
     Fixed {
@@ -503,6 +504,7 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Configuration for shared memory frame transport.
 #[derive(Clone, Debug)]
 pub struct SharedMemoryConfig {
     pub buffer_size: usize,
@@ -562,9 +564,9 @@ impl SharedMemoryConfig {
     }
 }
 
+/// Shared memory frame transport with ring buffer (Layer 1).
 #[derive(Debug)]
-pub struct SharedMemoryTransport {
-    // ArcSwap allows lock-free reads with occasional swap on reconnect
+pub struct SharedMemoryFrameTransport {
     send_buffer: ArcSwap<SharedMemoryRingBuffer>,
     recv_buffer: ArcSwap<SharedMemoryRingBuffer>,
     config: SharedMemoryConfig,
@@ -575,7 +577,8 @@ pub struct SharedMemoryTransport {
     reconnect_name: String,
 }
 
-impl SharedMemoryTransport {
+impl SharedMemoryFrameTransport {
+    /// Create a server-side transport.
     pub fn create_server(
         name: impl Into<String>,
         config: SharedMemoryConfig,
@@ -615,6 +618,7 @@ impl SharedMemoryTransport {
         })
     }
 
+    /// Connect as a client with custom config.
     pub fn connect_client_with_config(
         name: impl Into<String>,
         config: SharedMemoryConfig,
@@ -672,6 +676,7 @@ impl SharedMemoryTransport {
         )
     }
 
+    /// Connect as a client with default config.
     pub fn connect_client(name: impl Into<String>) -> TransportResult<Self> {
         Self::connect_client_with_config(name, SharedMemoryConfig::default())
     }
@@ -713,25 +718,24 @@ impl SharedMemoryTransport {
         })
     }
 
-    pub fn is_healthy(&self) -> bool {
+    pub fn shm_is_healthy(&self) -> bool {
         let recv_buf = self.recv_buffer.load();
         let control = unsafe { &*recv_buf.control };
         control.is_healthy(30) && *self.error_count.lock() < 10
     }
 
-    pub fn stats(&self) -> TransportStats {
+    pub fn shm_stats(&self) -> TransportStats {
         self.stats.lock().clone()
     }
 }
 
 #[async_trait]
-impl Transport for SharedMemoryTransport {
+impl FrameTransport for SharedMemoryFrameTransport {
     fn is_healthy(&self) -> bool {
-        self.is_healthy()
+        self.shm_is_healthy()
     }
 
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
-        // Try reconnect if disconnected
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
         if !self.connected.load(Ordering::Acquire) {
             self.try_reconnect()?;
         }
@@ -779,8 +783,7 @@ impl Transport for SharedMemoryTransport {
         }))
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
-        // Try reconnect if disconnected
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
         if !self.connected.load(Ordering::Acquire) {
             self.try_reconnect()?;
         }
@@ -847,6 +850,10 @@ impl Transport for SharedMemoryTransport {
     }
 }
 
+// Deprecated alias for backward compatibility
+#[deprecated(since = "0.2.0", note = "Use SharedMemoryFrameTransport instead")]
+pub type SharedMemoryTransport = SharedMemoryFrameTransport;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,33 +861,32 @@ mod tests {
     #[tokio::test]
     async fn test_cross_process_basic() {
         let config = SharedMemoryConfig::default();
-        let server = SharedMemoryTransport::create_server("test-basic", config).unwrap();
-        let client = SharedMemoryTransport::connect_client("test-basic").unwrap();
+        let server = SharedMemoryFrameTransport::create_server("test-basic", config).unwrap();
+        let client = SharedMemoryFrameTransport::connect_client("test-basic").unwrap();
 
-        client.send(b"Hello").await.unwrap();
-        let msg = server.recv().await.unwrap();
+        client.send_frame(b"Hello").await.unwrap();
+        let msg = server.recv_frame().await.unwrap();
         assert_eq!(msg.as_ref(), b"Hello");
     }
 
     #[tokio::test]
     async fn test_ring_buffer_wrapping() {
         let config = SharedMemoryConfig::default().with_buffer_size(8192);
-        let server = SharedMemoryTransport::create_server("test-wrap", config).unwrap();
-        let client = SharedMemoryTransport::connect_client("test-wrap").unwrap();
+        let server = SharedMemoryFrameTransport::create_server("test-wrap", config).unwrap();
+        let client = SharedMemoryFrameTransport::connect_client("test-wrap").unwrap();
 
         let chunk_size = 1000;
         let num_chunks = 20;
 
-        // Send 20KB total buffer is 8KB
         let send_handle = tokio::spawn(async move {
             for i in 0..num_chunks {
                 let data = vec![i as u8; chunk_size];
-                client.send(&data).await.unwrap();
+                client.send_frame(&data).await.unwrap();
             }
         });
 
         for i in 0..num_chunks {
-            let msg = server.recv().await.unwrap();
+            let msg = server.recv_frame().await.unwrap();
             assert_eq!(msg.len(), chunk_size);
             assert!(msg.iter().all(|&b| b == i as u8), "chunk {} corrupted", i);
         }
@@ -892,41 +898,38 @@ mod tests {
     async fn test_auto_reconnect() {
         let config = SharedMemoryConfig::default().with_auto_reconnect(true);
         let server =
-            SharedMemoryTransport::create_server("test-reconnect", config.clone()).unwrap();
+            SharedMemoryFrameTransport::create_server("test-reconnect", config.clone()).unwrap();
         let client =
-            SharedMemoryTransport::connect_client_with_config("test-reconnect", config).unwrap();
+            SharedMemoryFrameTransport::connect_client_with_config("test-reconnect", config)
+                .unwrap();
 
-        // Verify initial connection works
-        client.send(b"before").await.unwrap();
-        let msg = server.recv().await.unwrap();
+        client.send_frame(b"before").await.unwrap();
+        let msg = server.recv_frame().await.unwrap();
         assert_eq!(msg.as_ref(), b"before");
 
-        // Simulate disconnect by marking client as disconnected
         client.connected.store(false, Ordering::Release);
         assert!(!client.is_connected());
 
-        // Next send should trigger reconnect and succeed
-        client.send(b"after").await.unwrap();
+        client.send_frame(b"after").await.unwrap();
         assert!(client.is_connected());
 
-        let msg = server.recv().await.unwrap();
+        let msg = server.recv_frame().await.unwrap();
         assert_eq!(msg.as_ref(), b"after");
     }
 
     #[tokio::test]
     async fn test_configurable_timeout() {
-        // Use short timeout to verify config is respected
         let config = SharedMemoryConfig::default()
             .with_read_timeout(Duration::from_millis(100))
             .with_write_timeout(Duration::from_millis(100));
 
-        let _server = SharedMemoryTransport::create_server("test-timeout", config.clone()).unwrap();
+        let _server =
+            SharedMemoryFrameTransport::create_server("test-timeout", config.clone()).unwrap();
         let client =
-            SharedMemoryTransport::connect_client_with_config("test-timeout", config).unwrap();
+            SharedMemoryFrameTransport::connect_client_with_config("test-timeout", config).unwrap();
 
-        // recv should timeout quickly since no data is sent
         let start = Instant::now();
-        let result = client.recv().await;
+        let result = client.recv_frame().await;
         let elapsed = start.elapsed();
 
         assert!(result.is_err());

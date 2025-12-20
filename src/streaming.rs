@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
+use crate::channel::message::MessageChannel;
 use crate::codec::{BincodeCodec, Codec};
 use crate::error::{Result, RpcError};
 use crate::message::Message;
 use crate::message::types::{MessageId, MessageType};
-use crate::transport::message_transport::MessageTransport;
 
 pub type StreamId = u64;
 
@@ -23,7 +23,7 @@ pub fn next_stream_id() -> StreamId {
     STREAM_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-pub struct StreamSender<T: MessageTransport, C: Codec = BincodeCodec> {
+pub struct StreamSender<T: MessageChannel, C: Codec = BincodeCodec> {
     stream_id: StreamId,
     sequence: AtomicU64,
     transport: Arc<T>,
@@ -31,7 +31,7 @@ pub struct StreamSender<T: MessageTransport, C: Codec = BincodeCodec> {
     ended: std::sync::atomic::AtomicBool,
 }
 
-impl<T: MessageTransport> StreamSender<T, BincodeCodec> {
+impl<T: MessageChannel> StreamSender<T, BincodeCodec> {
     pub fn new(stream_id: StreamId, transport: Arc<T>) -> Self {
         Self {
             stream_id,
@@ -43,7 +43,7 @@ impl<T: MessageTransport> StreamSender<T, BincodeCodec> {
     }
 }
 
-impl<T: MessageTransport, C: Codec> StreamSender<T, C> {
+impl<T: MessageChannel, C: Codec> StreamSender<T, C> {
     pub fn with_codec(stream_id: StreamId, transport: Arc<T>, codec: C) -> Self {
         Self {
             stream_id,
@@ -282,26 +282,26 @@ impl Default for StreamManager<BincodeCodec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::channel::{ChannelConfig, ChannelTransport};
-    use crate::transport::message_transport::MessageTransportAdapter;
+    use crate::channel::message::MessageChannelAdapter;
+    use crate::transport::channel::{ChannelConfig, ChannelFrameTransport};
 
     #[tokio::test]
     async fn test_stream_sender_receiver() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
-        let sender_transport = Arc::new(MessageTransportAdapter::new(t1));
-        let receiver_transport = MessageTransportAdapter::new(t2);
+        let sender_channel = Arc::new(MessageChannelAdapter::new(t1));
+        let receiver_channel = MessageChannelAdapter::new(t2);
 
         let stream_id = next_stream_id();
-        let sender = StreamSender::new(stream_id, sender_transport);
+        let sender = StreamSender::new(stream_id, sender_channel);
 
         let manager = StreamManager::new();
         let receiver: StreamReceiver<i32> = manager.create_receiver(stream_id);
 
         let recv_handle = tokio::spawn(async move {
             loop {
-                let msg = receiver_transport.recv().await.unwrap();
+                let msg = receiver_channel.recv().await.unwrap();
                 if !manager.handle_message(&msg) {
                     break;
                 }
