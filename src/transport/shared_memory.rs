@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -261,7 +262,7 @@ impl SharedMemoryRingBuffer {
         }
     }
 
-    fn write(&self, data: &[u8]) -> TransportResult<()> {
+    fn write(&self, data: &[u8], timeout: Duration) -> TransportResult<()> {
         let control = unsafe { &*self.control };
 
         if !control.is_valid() {
@@ -283,7 +284,6 @@ impl SharedMemoryRingBuffer {
         }
 
         let start = Instant::now();
-        let timeout = Duration::from_secs(5);
 
         // Wait for space
         loop {
@@ -349,7 +349,7 @@ impl SharedMemoryRingBuffer {
         }
     }
 
-    fn read(&self) -> TransportResult<Bytes> {
+    fn read(&self, timeout: Duration) -> TransportResult<Bytes> {
         let control = unsafe { &*self.control };
 
         if !control.is_valid() {
@@ -360,7 +360,6 @@ impl SharedMemoryRingBuffer {
         }
 
         let start = Instant::now();
-        let timeout = Duration::from_secs(5);
 
         // Wait for data (at least 4 bytes for length)
         loop {
@@ -565,8 +564,9 @@ impl SharedMemoryConfig {
 
 #[derive(Debug)]
 pub struct SharedMemoryTransport {
-    send_buffer: Arc<SharedMemoryRingBuffer>,
-    recv_buffer: Arc<SharedMemoryRingBuffer>,
+    // ArcSwap allows lock-free reads with occasional swap on reconnect
+    send_buffer: ArcSwap<SharedMemoryRingBuffer>,
+    recv_buffer: ArcSwap<SharedMemoryRingBuffer>,
     config: SharedMemoryConfig,
     stats: Arc<Mutex<TransportStats>>,
     name: String,
@@ -604,8 +604,8 @@ impl SharedMemoryTransport {
         );
 
         Ok(Self {
-            send_buffer,
-            recv_buffer,
+            send_buffer: ArcSwap::new(send_buffer),
+            recv_buffer: ArcSwap::new(recv_buffer),
             config,
             stats: Arc::new(Mutex::new(TransportStats::default())),
             name: format!("{}-server", name),
@@ -647,8 +647,8 @@ impl SharedMemoryTransport {
                     );
 
                     return Ok(Self {
-                        send_buffer: send_arc,
-                        recv_buffer: recv_arc,
+                        send_buffer: ArcSwap::new(send_arc),
+                        recv_buffer: ArcSwap::new(recv_arc),
                         config: config.clone(),
                         stats: Arc::new(Mutex::new(TransportStats::default())),
                         name: format!("{}-client", name),
@@ -694,10 +694,12 @@ impl SharedMemoryTransport {
                 SharedMemoryRingBuffer::connect(&send_name),
                 SharedMemoryRingBuffer::connect(&recv_name),
             ) {
-                (Ok(_send), Ok(_recv)) => {
-                    self.connected.store(true, Ordering::Release);
-                    // Reset error count on successful reconnect
+                (Ok(send), Ok(recv)) => {
+                    // Atomic swap with newly connected buffers
+                    self.send_buffer.store(Arc::new(send));
+                    self.recv_buffer.store(Arc::new(recv));
                     *self.error_count.lock() = 0;
+                    self.connected.store(true, Ordering::Release);
                     return Ok(());
                 }
                 _ => continue,
@@ -712,7 +714,8 @@ impl SharedMemoryTransport {
     }
 
     pub fn is_healthy(&self) -> bool {
-        let control = unsafe { &*self.recv_buffer.control };
+        let recv_buf = self.recv_buffer.load();
+        let control = unsafe { &*recv_buf.control };
         control.is_healthy(30) && *self.error_count.lock() < 10
     }
 
@@ -741,9 +744,10 @@ impl Transport for SharedMemoryTransport {
             }
 
             let result = tokio::task::spawn_blocking({
-                let buffer = self.send_buffer.clone();
+                let buffer = self.send_buffer.load_full();
                 let data = data.to_vec();
-                move || buffer.write(&data)
+                let timeout = self.config.write_timeout.unwrap_or(Duration::from_secs(30));
+                move || buffer.write(&data, timeout)
             })
             .await;
 
@@ -789,8 +793,9 @@ impl Transport for SharedMemoryTransport {
             }
 
             let result = tokio::task::spawn_blocking({
-                let buffer = self.recv_buffer.clone();
-                move || buffer.read()
+                let buffer = self.recv_buffer.load_full();
+                let timeout = self.config.read_timeout.unwrap_or(Duration::from_secs(30));
+                move || buffer.read(timeout)
             })
             .await;
 
@@ -827,7 +832,8 @@ impl Transport for SharedMemoryTransport {
     }
 
     async fn close(&self) -> TransportResult<()> {
-        let control = unsafe { &*self.send_buffer.control };
+        let send_buf = self.send_buffer.load();
+        let control = unsafe { &*send_buf.control };
         control.connected.store(false, Ordering::Release);
         Ok(())
     }
@@ -880,5 +886,54 @@ mod tests {
         }
 
         send_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_auto_reconnect() {
+        let config = SharedMemoryConfig::default().with_auto_reconnect(true);
+        let server =
+            SharedMemoryTransport::create_server("test-reconnect", config.clone()).unwrap();
+        let client =
+            SharedMemoryTransport::connect_client_with_config("test-reconnect", config).unwrap();
+
+        // Verify initial connection works
+        client.send(b"before").await.unwrap();
+        let msg = server.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"before");
+
+        // Simulate disconnect by marking client as disconnected
+        client.connected.store(false, Ordering::Release);
+        assert!(!client.is_connected());
+
+        // Next send should trigger reconnect and succeed
+        client.send(b"after").await.unwrap();
+        assert!(client.is_connected());
+
+        let msg = server.recv().await.unwrap();
+        assert_eq!(msg.as_ref(), b"after");
+    }
+
+    #[tokio::test]
+    async fn test_configurable_timeout() {
+        // Use short timeout to verify config is respected
+        let config = SharedMemoryConfig::default()
+            .with_read_timeout(Duration::from_millis(100))
+            .with_write_timeout(Duration::from_millis(100));
+
+        let _server = SharedMemoryTransport::create_server("test-timeout", config.clone()).unwrap();
+        let client =
+            SharedMemoryTransport::connect_client_with_config("test-timeout", config).unwrap();
+
+        // recv should timeout quickly since no data is sent
+        let start = Instant::now();
+        let result = client.recv().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout took too long: {:?}",
+            elapsed
+        );
     }
 }

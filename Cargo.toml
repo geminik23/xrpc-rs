@@ -1,6 +1,6 @@
 [package]
 name = "xrpc-rs"
-version = "0.1.11"
+version = "0.1.12"
 edition = "2024"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 description = "async RPC library optimized for shared memory communication"
@@ -25,6 +25,7 @@ futures = "0.3"
 # Sync
 parking_lot = "0.12"
 crossbeam = "0.8"
+arc-swap = "1.7"
 
 # Shared Memory
 shared_memory = "0.12"
