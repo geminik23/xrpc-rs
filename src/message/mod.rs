@@ -81,8 +81,6 @@ impl<C: Codec + Default> Message<C> {
 
     pub fn error(id: MessageId, error_msg: impl Into<String>) -> Self {
         let error_msg = error_msg.into();
-        // Errors are always simple strings, we use the codec to serialize them
-        // fallback to empty if serialization fails (shouldn't happen for string)
         let codec = C::default();
         let payload = codec.encode(&error_msg).unwrap_or_default();
         Self {
@@ -91,6 +89,21 @@ impl<C: Codec + Default> Message<C> {
             method: String::new(),
             payload: Bytes::from(payload),
             metadata: MessageMetadata::new(),
+            codec,
+        }
+    }
+
+    /// Create an error message with stream_id for stream call failures
+    pub fn stream_error(id: MessageId, stream_id: u64, error_msg: impl Into<String>) -> Self {
+        let error_msg = error_msg.into();
+        let codec = C::default();
+        let payload = codec.encode(&error_msg).unwrap_or_default();
+        Self {
+            id,
+            msg_type: MessageType::Error,
+            method: String::new(),
+            payload: Bytes::from(payload),
+            metadata: MessageMetadata::new().with_stream(stream_id, 0),
             codec,
         }
     }

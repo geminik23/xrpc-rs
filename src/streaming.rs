@@ -254,6 +254,16 @@ impl<C: Codec + Clone> StreamManager<C> {
         }
     }
 
+    /// Forward error to stream receiver and close the stream
+    pub fn send_error(&self, stream_id: StreamId, error_msg: String) {
+        let streams = self.streams.lock();
+        if let Some(sender) = streams.get(&stream_id) {
+            let _ = sender.send(Err(RpcError::ServerError(error_msg)));
+        }
+        drop(streams);
+        self.remove_stream(stream_id);
+    }
+
     pub fn remove_stream(&self, stream_id: StreamId) {
         self.streams.lock().remove(&stream_id);
     }
