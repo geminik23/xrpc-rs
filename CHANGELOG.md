@@ -12,6 +12,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Batching support
 - Service Discovery & Load Balancing
 
+## [0.2.0] - 2025-12-20
+
+### Changed
+
+**Transport Renaming & Restructuring**
+
+Layer 1 (FrameTransport):
+
+- `Transport` trait -> `FrameTransport` (methods: `send_frame`, `recv_frame`)
+- `TcpTransport` -> `TcpFrameTransport`
+- `TcpTransportListener` -> `TcpFrameTransportListener`
+- `UnixTransport` -> `UnixFrameTransport`
+- `UnixTransportListener` -> `UnixFrameTransportListener`
+- `ChannelTransport` -> `ChannelFrameTransport`
+- `SharedMemoryTransport` -> `SharedMemoryFrameTransport`
+- `ArcTransport` -> `ArcFrameTransport`
+
+Layer 2 (Channel):
+
+- `MessageTransport` trait -> `MessageChannel`
+- `MessageTransportAdapter` -> `MessageChannelAdapter`
+- `RawTransport` -> `SerdeChannel`
+- Moved Layer 2 components to new `channel/` module
+
+### Added
+
+- `ZeroCopyTransport` trait for `ArcFrameTransport` (typed zero-copy API)
+- Deprecated aliases for backward compatibility
+
+### Deprecated
+
+- Old names (`Transport`, `TcpTransport`, `MessageTransportAdapter`, etc.) - use new names
+
 ## [0.1.12] - 2025-12-20
 
 ### Added

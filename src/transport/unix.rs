@@ -1,9 +1,8 @@
-#![cfg(unix)]
-
 use crate::error::{TransportError, TransportResult};
-use crate::transport::{Transport, TransportStats};
+use crate::transport::{FrameTransport, TransportStats};
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::Mutex as SyncMutex;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
-/// Configuration for Unix domain socket transport
+/// Configuration for Unix frame transport.
 #[derive(Debug, Clone)]
 pub struct UnixConfig {
     /// Maximum message size in bytes
@@ -28,7 +27,7 @@ pub struct UnixConfig {
 impl Default for UnixConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 16 * 1024 * 1024, // 16 MB
+            max_message_size: 16 * 1024 * 1024,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(30)),
@@ -37,46 +36,41 @@ impl Default for UnixConfig {
 }
 
 impl UnixConfig {
-    /// Create a new configuration with custom max message size
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
-    /// Set connection timeout
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
-    /// Set read timeout
     pub fn with_read_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.read_timeout = timeout;
         self
     }
 
-    /// Set write timeout
     pub fn with_write_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.write_timeout = timeout;
         self
     }
 }
 
-/// Unix domain socket transport for local IPC
+/// Unix domain socket frame transport with length-prefixed framing (Layer 1).
 #[derive(Debug)]
-pub struct UnixSocketTransport {
+pub struct UnixFrameTransport {
     config: UnixConfig,
     stream: Arc<Mutex<UnixStream>>,
     path: PathBuf,
     connected: Arc<AtomicBool>,
-    stats: Arc<Mutex<TransportStats>>,
+    stats: Arc<SyncMutex<TransportStats>>,
 }
 
-impl UnixSocketTransport {
-    /// Create a new Unix socket transport by connecting to a path
-    pub async fn connect<P: AsRef<Path>>(path: P, config: UnixConfig) -> TransportResult<Self> {
+impl UnixFrameTransport {
+    /// Connect to a Unix socket at the given path.
+    pub async fn connect(path: impl AsRef<Path>, config: UnixConfig) -> TransportResult<Self> {
         let path = path.as_ref().to_path_buf();
-
         let stream = tokio::time::timeout(config.connect_timeout, UnixStream::connect(&path))
             .await
             .map_err(|_| TransportError::Timeout {
@@ -94,27 +88,25 @@ impl UnixSocketTransport {
             stream: Arc::new(Mutex::new(stream)),
             path,
             connected: Arc::new(AtomicBool::new(true)),
-            stats: Arc::new(Mutex::new(TransportStats::default())),
+            stats: Arc::new(SyncMutex::new(TransportStats::default())),
         })
     }
 
-    /// Create a new Unix socket transport from an existing stream
-    pub fn from_stream<P: AsRef<Path>>(stream: UnixStream, path: P, config: UnixConfig) -> Self {
+    /// Create from an existing stream.
+    pub fn from_stream(stream: UnixStream, path: PathBuf, config: UnixConfig) -> Self {
         Self {
             config,
             stream: Arc::new(Mutex::new(stream)),
-            path: path.as_ref().to_path_buf(),
+            path,
             connected: Arc::new(AtomicBool::new(true)),
-            stats: Arc::new(Mutex::new(TransportStats::default())),
+            stats: Arc::new(SyncMutex::new(TransportStats::default())),
         }
     }
 
-    /// Get the socket path
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Send raw bytes with length prefix
     async fn send_bytes(&self, data: &[u8]) -> TransportResult<()> {
         if !self.is_connected() {
             return Err(TransportError::NotConnected);
@@ -127,7 +119,6 @@ impl UnixSocketTransport {
             });
         }
 
-        // Write length prefix (4 bytes, little-endian)
         let len = data.len() as u32;
         let len_bytes = len.to_le_bytes();
 
@@ -153,33 +144,29 @@ impl UnixSocketTransport {
             Ok::<(), TransportError>(())
         };
 
-        // Apply write timeout if configured
         if let Some(timeout) = self.config.write_timeout {
             tokio::time::timeout(timeout, write_op)
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "Unix socket write".to_string(),
+                    operation: "Unix write".to_string(),
                 })??;
         } else {
             write_op.await?;
         }
 
-        // Update stats
-        let mut stats = self.stats.lock().await;
+        let mut stats = self.stats.lock();
         stats.messages_sent += 1;
-        stats.bytes_sent += data.len() as u64 + 4; // Include length prefix
+        stats.bytes_sent += data.len() as u64 + 4;
 
         Ok(())
     }
 
-    /// Receive raw bytes with length prefix
     async fn recv_bytes(&self) -> TransportResult<Bytes> {
         if !self.is_connected() {
             return Err(TransportError::NotConnected);
         }
 
-        // Read length prefix (4 bytes)
         let mut len_bytes = [0u8; 4];
 
         let read_len_op = async {
@@ -200,7 +187,7 @@ impl UnixSocketTransport {
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "Unix socket read length".to_string(),
+                    operation: "Unix read length".to_string(),
                 })??;
         } else {
             read_len_op.await?;
@@ -215,7 +202,6 @@ impl UnixSocketTransport {
             });
         }
 
-        // Read message data
         let mut buffer = vec![0u8; len];
 
         let read_data_op = async {
@@ -236,28 +222,27 @@ impl UnixSocketTransport {
                 .await
                 .map_err(|_| TransportError::Timeout {
                     duration_ms: timeout.as_millis() as u64,
-                    operation: "Unix socket read data".to_string(),
+                    operation: "Unix read data".to_string(),
                 })??;
         } else {
             read_data_op.await?;
         }
 
-        // Update stats
-        let mut stats = self.stats.lock().await;
+        let mut stats = self.stats.lock();
         stats.messages_received += 1;
-        stats.bytes_received += len as u64 + 4; // Include length prefix
+        stats.bytes_received += len as u64 + 4;
 
         Ok(Bytes::from(buffer))
     }
 }
 
 #[async_trait]
-impl Transport for UnixSocketTransport {
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
+impl FrameTransport for UnixFrameTransport {
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
         self.send_bytes(data).await
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
         self.recv_bytes().await
     }
 
@@ -275,16 +260,7 @@ impl Transport for UnixSocketTransport {
     }
 
     fn stats(&self) -> Option<TransportStats> {
-        // Try to get stats synchronously if possible
-        if let Ok(stats) = self.stats.try_lock() {
-            Some(stats.clone())
-        } else {
-            // Fall back to blocking wait in a runtime context
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(async { Some(self.stats.lock().await.clone()) })
-            })
-        }
+        Some(self.stats.lock().clone())
     }
 
     fn name(&self) -> &str {
@@ -292,24 +268,24 @@ impl Transport for UnixSocketTransport {
     }
 }
 
-/// Unix domain socket listener for accepting incoming connections
-pub struct UnixSocketListener {
+/// Unix socket listener for accepting incoming connections (Layer 1).
+pub struct UnixFrameTransportListener {
     listener: UnixListener,
     config: UnixConfig,
     path: PathBuf,
 }
 
-impl UnixSocketListener {
-    /// Bind to a Unix socket path and listen for incoming connections
-    pub async fn bind<P: AsRef<Path>>(path: P, config: UnixConfig) -> TransportResult<Self> {
+impl UnixFrameTransportListener {
+    /// Bind to a Unix socket path.
+    pub async fn bind(path: impl AsRef<Path>, config: UnixConfig) -> TransportResult<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // Remove the socket file if it already exists
+        // Remove existing socket file if it exists
         if path.exists() {
             std::fs::remove_file(&path).map_err(|e| TransportError::ConnectionFailed {
                 name: path.display().to_string(),
                 attempts: 1,
-                reason: format!("Failed to remove existing socket file: {}", e),
+                reason: format!("Failed to remove existing socket: {}", e),
             })?;
         }
 
@@ -326,13 +302,12 @@ impl UnixSocketListener {
         })
     }
 
-    /// Get the socket path
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Accept an incoming connection
-    pub async fn accept(&self) -> TransportResult<UnixSocketTransport> {
+    /// Accept an incoming connection.
+    pub async fn accept(&self) -> TransportResult<UnixFrameTransport> {
         let (stream, _addr) =
             self.listener
                 .accept()
@@ -343,180 +318,174 @@ impl UnixSocketListener {
                     reason: format!("Failed to accept connection: {}", e),
                 })?;
 
-        Ok(UnixSocketTransport::from_stream(
+        Ok(UnixFrameTransport::from_stream(
             stream,
-            &self.path,
+            self.path.clone(),
             self.config.clone(),
         ))
     }
 }
 
-impl Drop for UnixSocketListener {
+impl Drop for UnixFrameTransportListener {
     fn drop(&mut self) {
-        // Clean up the socket file
         let _ = std::fs::remove_file(&self.path);
     }
 }
 
+// Deprecated aliases for backward compatibility
+#[deprecated(since = "0.2.0", note = "Use UnixFrameTransport instead")]
+pub type UnixSocketTransport = UnixFrameTransport;
+
+#[deprecated(since = "0.2.0", note = "Use UnixFrameTransportListener instead")]
+pub type UnixSocketListener = UnixFrameTransportListener;
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
+    use std::sync::atomic::AtomicU64;
 
-    fn temp_socket_path(name: &str) -> PathBuf {
-        let mut path = env::temp_dir();
-        path.push(format!("xrpc_test_{}_{}.sock", name, std::process::id()));
-        path
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_socket_path() -> PathBuf {
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("xrpc_test_{}.sock", id))
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unix_transport_connection() {
-        let socket_path = temp_socket_path("connection");
+        let path = temp_socket_path();
         let config = UnixConfig::default();
 
-        // Start a listener
-        let listener = UnixSocketListener::bind(&socket_path, config.clone())
+        let listener = UnixFrameTransportListener::bind(&path, config.clone())
             .await
             .unwrap();
 
-        // Connect a client
-        let client =
-            tokio::spawn(async move { UnixSocketTransport::connect(&socket_path, config).await });
+        let path_clone = path.clone();
+        let config_clone = config.clone();
+        let client_task =
+            tokio::spawn(
+                async move { UnixFrameTransport::connect(&path_clone, config_clone).await },
+            );
 
-        // Accept the connection
         let server = listener.accept().await.unwrap();
-
-        let client = client.await.unwrap().unwrap();
+        let client = client_task.await.unwrap().unwrap();
 
         assert!(client.is_connected());
         assert!(server.is_connected());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unix_send_recv() {
-        let socket_path = temp_socket_path("send_recv");
+        let path = temp_socket_path();
         let config = UnixConfig::default();
 
-        let listener = UnixSocketListener::bind(&socket_path, config.clone())
+        let listener = UnixFrameTransportListener::bind(&path, config.clone())
             .await
             .unwrap();
 
-        // Connect a client
-        let socket_path_clone = socket_path.clone();
+        let path_clone = path.clone();
+        let config_clone = config.clone();
         let client_task =
             tokio::spawn(
-                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+                async move { UnixFrameTransport::connect(&path_clone, config_clone).await },
             );
 
-        // Accept the connection
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send from client to server
         let test_data = b"Hello, Unix!";
-        client.send(test_data).await.unwrap();
+        client.send_frame(test_data).await.unwrap();
 
-        let received = server.recv().await.unwrap();
+        let received = server.recv_frame().await.unwrap();
         assert_eq!(received.as_ref(), test_data);
 
-        // Send from server to client
         let response_data = b"Hello back!";
-        server.send(response_data).await.unwrap();
+        server.send_frame(response_data).await.unwrap();
 
-        let received = client.recv().await.unwrap();
+        let received = client.recv_frame().await.unwrap();
         assert_eq!(received.as_ref(), response_data);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unix_stats() {
-        let socket_path = temp_socket_path("stats");
+        let path = temp_socket_path();
         let config = UnixConfig::default();
 
-        let listener = UnixSocketListener::bind(&socket_path, config.clone())
+        let listener = UnixFrameTransportListener::bind(&path, config.clone())
             .await
             .unwrap();
 
-        let socket_path_clone = socket_path.clone();
+        let path_clone = path.clone();
+        let config_clone = config.clone();
         let client_task =
             tokio::spawn(
-                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+                async move { UnixFrameTransport::connect(&path_clone, config_clone).await },
             );
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send a message
         let test_data = b"Test message";
-        client.send(test_data).await.unwrap();
-        server.recv().await.unwrap();
+        client.send_frame(test_data).await.unwrap();
+        server.recv_frame().await.unwrap();
 
-        // Check stats
         let client_stats = client.stats().unwrap();
         assert_eq!(client_stats.messages_sent, 1);
-        assert!(client_stats.bytes_sent > test_data.len() as u64); // Includes length prefix
+        assert!(client_stats.bytes_sent > test_data.len() as u64);
 
         let server_stats = server.stats().unwrap();
         assert_eq!(server_stats.messages_received, 1);
         assert!(server_stats.bytes_received > test_data.len() as u64);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unix_large_message() {
-        let socket_path = temp_socket_path("large");
+        let path = temp_socket_path();
         let config = UnixConfig::default();
 
-        let listener = UnixSocketListener::bind(&socket_path, config.clone())
+        let listener = UnixFrameTransportListener::bind(&path, config.clone())
             .await
             .unwrap();
 
-        let socket_path_clone = socket_path.clone();
+        let path_clone = path.clone();
+        let config_clone = config.clone();
         let client_task =
             tokio::spawn(
-                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+                async move { UnixFrameTransport::connect(&path_clone, config_clone).await },
             );
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send a large message (1 MB)
         let large_data = vec![0xAB; 1024 * 1024];
+        client.send_frame(&large_data).await.unwrap();
 
-        let server_task = tokio::spawn({
-            let server = server;
-            let expected = large_data.clone();
-            async move {
-                let received = server.recv().await.unwrap();
-                assert_eq!(received.len(), expected.len());
-                assert_eq!(received.as_ref(), expected.as_slice());
-            }
-        });
-
-        client.send(&large_data).await.unwrap();
-
-        server_task.await.unwrap();
+        let received = server.recv_frame().await.unwrap();
+        assert_eq!(received.len(), large_data.len());
+        assert_eq!(received.as_ref(), large_data.as_slice());
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test]
     async fn test_unix_message_too_large() {
-        let socket_path = temp_socket_path("too_large");
+        let path = temp_socket_path();
         let config = UnixConfig::default().with_max_message_size(1024);
 
-        let listener = UnixSocketListener::bind(&socket_path, config.clone())
+        let listener = UnixFrameTransportListener::bind(&path, config.clone())
             .await
             .unwrap();
 
-        let socket_path_clone = socket_path.clone();
+        let path_clone = path.clone();
+        let config_clone = config.clone();
         let client_task =
             tokio::spawn(
-                async move { UnixSocketTransport::connect(&socket_path_clone, config).await },
+                async move { UnixFrameTransport::connect(&path_clone, config_clone).await },
             );
 
         let _server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Try to send a message larger than the limit
         let large_data = vec![0; 2048];
-        let result = client.send(&large_data).await;
+        let result = client.send_frame(&large_data).await;
 
         assert!(matches!(
             result,

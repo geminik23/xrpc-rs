@@ -1,5 +1,5 @@
 use crate::error::{TransportError, TransportResult};
-use crate::transport::{Transport, TransportStats};
+use crate::transport::{FrameTransport, TransportStats};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -10,25 +10,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-/// Configuration for TCP transport
+/// Configuration for TCP frame transport.
 #[derive(Debug, Clone)]
 pub struct TcpConfig {
-    /// Maximum message size in bytes
     pub max_message_size: usize,
-    /// Connection timeout
     pub connect_timeout: Duration,
-    /// Read timeout (None for no timeout)
     pub read_timeout: Option<Duration>,
-    /// Write timeout (None for no timeout)
     pub write_timeout: Option<Duration>,
-    /// Enable TCP_NODELAY (disable Nagle's algorithm)
     pub nodelay: bool,
 }
 
 impl Default for TcpConfig {
     fn default() -> Self {
         Self {
-            max_message_size: 16 * 1024 * 1024, // 16 MB
+            max_message_size: 16 * 1024 * 1024,
             connect_timeout: Duration::from_secs(5),
             read_timeout: Some(Duration::from_secs(30)),
             write_timeout: Some(Duration::from_secs(30)),
@@ -38,40 +33,35 @@ impl Default for TcpConfig {
 }
 
 impl TcpConfig {
-    /// Create a new configuration with custom max message size
     pub fn with_max_message_size(mut self, size: usize) -> Self {
         self.max_message_size = size;
         self
     }
 
-    /// Set connection timeout
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
     }
 
-    /// Set read timeout
     pub fn with_read_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.read_timeout = timeout;
         self
     }
 
-    /// Set write timeout
     pub fn with_write_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.write_timeout = timeout;
         self
     }
 
-    /// Enable or disable TCP_NODELAY
     pub fn with_nodelay(mut self, nodelay: bool) -> Self {
         self.nodelay = nodelay;
         self
     }
 }
 
-/// TCP transport for network-based RPC communication
+/// TCP-based frame transport with length-prefixed framing (Layer 1).
 #[derive(Debug)]
-pub struct TcpTransport {
+pub struct TcpFrameTransport {
     config: TcpConfig,
     stream: Arc<Mutex<TcpStream>>,
     peer_addr: SocketAddr,
@@ -79,8 +69,8 @@ pub struct TcpTransport {
     stats: Arc<Mutex<TransportStats>>,
 }
 
-impl TcpTransport {
-    /// Create a new TCP transport by connecting to an address
+impl TcpFrameTransport {
+    /// Create a new TCP frame transport by connecting to an address.
     pub async fn connect(addr: SocketAddr, config: TcpConfig) -> TransportResult<Self> {
         let stream = tokio::time::timeout(config.connect_timeout, TcpStream::connect(addr))
             .await
@@ -94,7 +84,6 @@ impl TcpTransport {
                 reason: e.to_string(),
             })?;
 
-        // Disable Nagle's algorithm for lower latency
         if config.nodelay {
             stream.set_nodelay(true).map_err(|e| {
                 TransportError::Protocol(format!("Failed to set TCP_NODELAY: {}", e))
@@ -114,13 +103,12 @@ impl TcpTransport {
         })
     }
 
-    /// Create a new TCP transport from an existing stream
+    /// Create a new TCP frame transport from an existing stream.
     pub fn from_stream(stream: TcpStream, config: TcpConfig) -> TransportResult<Self> {
         let peer_addr = stream
             .peer_addr()
             .map_err(|e| TransportError::Protocol(format!("Failed to get peer address: {}", e)))?;
 
-        // Disable Nagle's algorithm for lower latency
         if config.nodelay {
             stream.set_nodelay(true).map_err(|e| {
                 TransportError::Protocol(format!("Failed to set TCP_NODELAY: {}", e))
@@ -136,12 +124,10 @@ impl TcpTransport {
         })
     }
 
-    /// Get the peer address
     pub fn peer_addr(&self) -> SocketAddr {
         self.peer_addr
     }
 
-    /// Send raw bytes with length prefix
     async fn send_bytes(&self, data: &[u8]) -> TransportResult<()> {
         if !self.is_connected() {
             return Err(TransportError::NotConnected);
@@ -154,7 +140,6 @@ impl TcpTransport {
             });
         }
 
-        // Write length prefix (4 bytes, little-endian)
         let len = data.len() as u32;
         let len_bytes = len.to_le_bytes();
 
@@ -180,7 +165,6 @@ impl TcpTransport {
             Ok::<(), TransportError>(())
         };
 
-        // Apply write timeout if configured
         if let Some(timeout) = self.config.write_timeout {
             tokio::time::timeout(timeout, write_op)
                 .await
@@ -192,21 +176,18 @@ impl TcpTransport {
             write_op.await?;
         }
 
-        // Update stats
         let mut stats = self.stats.lock().await;
         stats.messages_sent += 1;
-        stats.bytes_sent += data.len() as u64 + 4; // Include length prefix
+        stats.bytes_sent += data.len() as u64 + 4;
 
         Ok(())
     }
 
-    /// Receive raw bytes with length prefix
     async fn recv_bytes(&self) -> TransportResult<Bytes> {
         if !self.is_connected() {
             return Err(TransportError::NotConnected);
         }
 
-        // Read length prefix (4 bytes)
         let mut len_bytes = [0u8; 4];
 
         let read_len_op = async {
@@ -242,7 +223,6 @@ impl TcpTransport {
             });
         }
 
-        // Read message data
         let mut buffer = vec![0u8; len];
 
         let read_data_op = async {
@@ -269,22 +249,21 @@ impl TcpTransport {
             read_data_op.await?;
         }
 
-        // Update stats
         let mut stats = self.stats.lock().await;
         stats.messages_received += 1;
-        stats.bytes_received += len as u64 + 4; // Include length prefix
+        stats.bytes_received += len as u64 + 4;
 
         Ok(Bytes::from(buffer))
     }
 }
 
 #[async_trait]
-impl Transport for TcpTransport {
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
+impl FrameTransport for TcpFrameTransport {
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
         self.send_bytes(data).await
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
         self.recv_bytes().await
     }
 
@@ -302,11 +281,9 @@ impl Transport for TcpTransport {
     }
 
     fn stats(&self) -> Option<TransportStats> {
-        // Try to get stats synchronously if possible
         if let Ok(stats) = self.stats.try_lock() {
             Some(stats.clone())
         } else {
-            // Fall back to blocking wait in a runtime context
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
                     .block_on(async { Some(self.stats.lock().await.clone()) })
@@ -319,14 +296,14 @@ impl Transport for TcpTransport {
     }
 }
 
-/// TCP listener for accepting incoming connections
-pub struct TcpTransportListener {
+/// TCP listener for accepting incoming connections (Layer 1).
+pub struct TcpFrameTransportListener {
     listener: TcpListener,
     config: TcpConfig,
 }
 
-impl TcpTransportListener {
-    /// Bind to a socket address and listen for incoming connections
+impl TcpFrameTransportListener {
+    /// Bind to a socket address and listen for incoming connections.
     pub async fn bind(addr: SocketAddr, config: TcpConfig) -> TransportResult<Self> {
         let listener =
             TcpListener::bind(addr)
@@ -340,15 +317,14 @@ impl TcpTransportListener {
         Ok(Self { listener, config })
     }
 
-    /// Get the local address the listener is bound to
     pub fn local_addr(&self) -> TransportResult<SocketAddr> {
         self.listener
             .local_addr()
             .map_err(|e| TransportError::Protocol(format!("Failed to get local address: {}", e)))
     }
 
-    /// Accept an incoming connection
-    pub async fn accept(&self) -> TransportResult<TcpTransport> {
+    /// Accept an incoming connection.
+    pub async fn accept(&self) -> TransportResult<TcpFrameTransport> {
         let (stream, _addr) =
             self.listener
                 .accept()
@@ -359,9 +335,16 @@ impl TcpTransportListener {
                     reason: format!("Failed to accept connection: {}", e),
                 })?;
 
-        TcpTransport::from_stream(stream, self.config.clone())
+        TcpFrameTransport::from_stream(stream, self.config.clone())
     }
 }
+
+// Deprecated aliases for backward compatibility
+#[deprecated(since = "0.2.0", note = "Use TcpFrameTransport instead")]
+pub type TcpTransport = TcpFrameTransport;
+
+#[deprecated(since = "0.2.0", note = "Use TcpFrameTransportListener instead")]
+pub type TcpTransportListener = TcpFrameTransportListener;
 
 #[cfg(test)]
 mod tests {
@@ -370,20 +353,15 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_transport_connection() {
         let config = TcpConfig::default();
-
-        // Start a listener
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
-            .await
-            .unwrap();
+        let listener =
+            TcpFrameTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+                .await
+                .unwrap();
 
         let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move { TcpFrameTransport::connect(addr, config).await });
 
-        // Connect a client
-        let client = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
-
-        // Accept the connection
         let server = listener.accept().await.unwrap();
-
         let client = client.await.unwrap().unwrap();
 
         assert!(client.is_connected());
@@ -393,59 +371,53 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_send_recv() {
         let config = TcpConfig::default();
-
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
-            .await
-            .unwrap();
+        let listener =
+            TcpFrameTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+                .await
+                .unwrap();
 
         let addr = listener.local_addr().unwrap();
+        let client_task =
+            tokio::spawn(async move { TcpFrameTransport::connect(addr, config).await });
 
-        // Connect a client
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
-
-        // Accept the connection
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send from client to server
         let test_data = b"Hello, TCP!";
-        client.send(test_data).await.unwrap();
+        client.send_frame(test_data).await.unwrap();
 
-        let received = server.recv().await.unwrap();
+        let received = server.recv_frame().await.unwrap();
         assert_eq!(received.as_ref(), test_data);
 
-        // Send from server to client
         let response_data = b"Hello back!";
-        server.send(response_data).await.unwrap();
+        server.send_frame(response_data).await.unwrap();
 
-        let received = client.recv().await.unwrap();
+        let received = client.recv_frame().await.unwrap();
         assert_eq!(received.as_ref(), response_data);
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_tcp_stats() {
         let config = TcpConfig::default();
-
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
-            .await
-            .unwrap();
+        let listener =
+            TcpFrameTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+                .await
+                .unwrap();
 
         let addr = listener.local_addr().unwrap();
-
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let client_task =
+            tokio::spawn(async move { TcpFrameTransport::connect(addr, config).await });
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send a message
         let test_data = b"Test message";
-        client.send(test_data).await.unwrap();
-        server.recv().await.unwrap();
+        client.send_frame(test_data).await.unwrap();
+        server.recv_frame().await.unwrap();
 
-        // Check stats
         let client_stats = client.stats().unwrap();
         assert_eq!(client_stats.messages_sent, 1);
-        assert!(client_stats.bytes_sent > test_data.len() as u64); // Includes length prefix
+        assert!(client_stats.bytes_sent > test_data.len() as u64);
 
         let server_stats = server.stats().unwrap();
         assert_eq!(server_stats.messages_received, 1);
@@ -455,23 +427,22 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_large_message() {
         let config = TcpConfig::default();
-
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
-            .await
-            .unwrap();
+        let listener =
+            TcpFrameTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+                .await
+                .unwrap();
 
         let addr = listener.local_addr().unwrap();
-
-        let client_task = tokio::spawn(async move { TcpTransport::connect(addr, config).await });
+        let client_task =
+            tokio::spawn(async move { TcpFrameTransport::connect(addr, config).await });
 
         let server = listener.accept().await.unwrap();
         let client = client_task.await.unwrap().unwrap();
 
-        // Send a large message (1 MB)
         let large_data = vec![0xAB; 1024 * 1024];
-        client.send(&large_data).await.unwrap();
+        client.send_frame(&large_data).await.unwrap();
 
-        let received = server.recv().await.unwrap();
+        let received = server.recv_frame().await.unwrap();
         assert_eq!(received.len(), large_data.len());
         assert_eq!(received.as_ref(), large_data.as_slice());
     }
@@ -479,18 +450,16 @@ mod tests {
     #[tokio::test]
     async fn test_tcp_message_too_large() {
         let config = TcpConfig::default().with_max_message_size(1024);
-
-        let listener = TcpTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
-            .await
-            .unwrap();
+        let listener =
+            TcpFrameTransportListener::bind("127.0.0.1:0".parse().unwrap(), config.clone())
+                .await
+                .unwrap();
 
         let addr = listener.local_addr().unwrap();
+        let client = TcpFrameTransport::connect(addr, config).await.unwrap();
 
-        let client = TcpTransport::connect(addr, config).await.unwrap();
-
-        // Try to send a message larger than the limit
         let large_data = vec![0; 2048];
-        let result = client.send(&large_data).await;
+        let result = client.send_frame(&large_data).await;
 
         assert!(matches!(
             result,

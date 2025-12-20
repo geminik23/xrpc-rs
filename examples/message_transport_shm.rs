@@ -1,7 +1,9 @@
+//! Example demonstrating MessageChannel with SharedMemory transport.
+
 use serde::{Deserialize, Serialize};
 use std::env;
 use xrpc::{
-    Message, MessageTransport, MessageTransportAdapter, SharedMemoryConfig, SharedMemoryTransport,
+    Message, MessageChannel, MessageChannelAdapter, SharedMemoryConfig, SharedMemoryFrameTransport,
     message::types::{CompressionType, MessageType},
 };
 
@@ -22,7 +24,7 @@ struct LogEvent {
     message: String,
 }
 
-const SERVICE_NAME: &str = "test_message_tranport";
+const SERVICE_NAME: &str = "test_message_channel";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,14 +47,13 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Server] Creating shared memory transport");
 
     let config = SharedMemoryConfig::default();
-    let transport = SharedMemoryTransport::create_server(SERVICE_NAME, config)?;
-    let msg_transport = MessageTransportAdapter::new(transport);
+    let transport = SharedMemoryFrameTransport::create_server(SERVICE_NAME, config)?;
+    let channel = MessageChannelAdapter::new(transport);
 
     println!("[Server] Waiting for messages");
 
-    // Wait for messages
     loop {
-        let message = msg_transport.recv().await?;
+        let message = channel.recv().await?;
 
         match message.msg_type {
             MessageType::Call => {
@@ -70,32 +71,32 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                             result: req.a + req.b,
                         };
                         let reply = Message::reply(message.id, resp)?;
-                        msg_transport.send(&reply).await?;
+                        channel.send(&reply).await?;
                         println!("[Server] Sent reply");
                     }
                     "divide" => {
                         let req: AddRequest = message.deserialize_payload()?;
                         if req.b == 0 {
                             let error = Message::error(message.id, "Division by zero");
-                            msg_transport.send(&error).await?;
+                            channel.send(&error).await?;
                             println!("[Server] Sent error: division by zero");
                         } else {
                             let resp = AddResponse {
                                 result: req.a / req.b,
                             };
                             let reply = Message::reply(message.id, resp)?;
-                            msg_transport.send(&reply).await?;
+                            channel.send(&reply).await?;
                         }
                     }
                     "shutdown" => {
                         println!("[Server] Shutdown requested");
                         let reply = Message::reply(message.id, "ok")?;
-                        msg_transport.send(&reply).await?;
+                        channel.send(&reply).await?;
                         break;
                     }
                     _ => {
                         let error = Message::error(message.id, "Unknown method");
-                        msg_transport.send(&error).await?;
+                        channel.send(&error).await?;
                     }
                 }
             }
@@ -107,7 +108,7 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             _ => {
-                println!("[Server] unkown message type: {:?}", message.msg_type);
+                println!("[Server] Unknown message type: {:?}", message.msg_type);
             }
         }
     }
@@ -119,17 +120,17 @@ async fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     println!("[Client] Connecting to shared memory transport");
 
-    let transport = SharedMemoryTransport::connect_client(SERVICE_NAME)?;
-    let msg_transport = MessageTransportAdapter::new(transport);
+    let transport = SharedMemoryFrameTransport::connect_client(SERVICE_NAME)?;
+    let channel = MessageChannelAdapter::new(transport);
 
     println!("[Client] Connected!");
 
     // Call: add (no compression)
     println!("\n[Client] Calling add (10 + 32)");
     let call = Message::call("add", AddRequest { a: 10, b: 32 })?;
-    msg_transport.send(&call).await?;
+    channel.send(&call).await?;
 
-    let reply = msg_transport.recv().await?;
+    let reply = channel.recv().await?;
     let resp: AddResponse = reply.deserialize_payload()?;
     println!("[Client] Result: {}", resp.result);
 
@@ -137,9 +138,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n[Client] Calling add with LZ4 compression (100 + 200)");
     let mut call = Message::call("add", AddRequest { a: 100, b: 200 })?;
     call.metadata.compression = CompressionType::Lz4;
-    msg_transport.send(&call).await?;
+    channel.send(&call).await?;
 
-    let reply = msg_transport.recv().await?;
+    let reply = channel.recv().await?;
     let resp: AddResponse = reply.deserialize_payload()?;
     println!(
         "[Client] Result: {} (compression: {:?})",
@@ -149,9 +150,9 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     // Call: divide by zero (expect error)
     println!("\n[Client] Calling divide (10 / 0)");
     let call = Message::call("divide", AddRequest { a: 10, b: 0 })?;
-    msg_transport.send(&call).await?;
+    channel.send(&call).await?;
 
-    let reply = msg_transport.recv().await?;
+    let reply = channel.recv().await?;
     if reply.msg_type == MessageType::Error {
         let error_msg: String = reply.deserialize_payload()?;
         println!("[Client] Got error: {}", error_msg);
@@ -166,14 +167,14 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
             message: "Client started successfully".to_string(),
         },
     )?;
-    msg_transport.send(&notification).await?;
+    channel.send(&notification).await?;
     println!("[Client] Notification sent (no response expected)");
 
     // Shutdown
     println!("\n[Client] Sending shutdown...");
     let call = Message::call("shutdown", ())?;
-    msg_transport.send(&call).await?;
-    let _ = msg_transport.recv().await?;
+    channel.send(&call).await?;
+    let _ = channel.recv().await?;
     println!("[Client] Done!");
 
     Ok(())

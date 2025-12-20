@@ -7,17 +7,33 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{TransportError, TransportResult};
-use crate::transport::{Transport, TransportStats};
+use crate::transport::{FrameTransport, TransportStats};
 
-/// Arc-based transport for same-process communication without serialization
-pub struct ArcTransport {
+/// Trait for zero-copy typed transport (same-process only).
+pub trait ZeroCopyTransport {
+    /// Send typed data without serialization.
+    fn send_typed<T: Send + Sync + 'static>(&self, data: T) -> TransportResult<()>;
+
+    /// Receive typed data without deserialization.
+    fn recv_typed<T: Send + Sync + 'static>(&self) -> TransportResult<Arc<T>>;
+
+    /// Try receive with timeout.
+    fn recv_typed_timeout<T: Send + Sync + 'static>(
+        &self,
+        timeout: Duration,
+    ) -> TransportResult<Option<Arc<T>>>;
+}
+
+/// Zero-copy in-process frame transport using Arc (Layer 1).
+pub struct ArcFrameTransport {
     sender: Sender<Arc<dyn Any + Send + Sync>>,
     receiver: Receiver<Arc<dyn Any + Send + Sync>>,
     stats: Arc<Mutex<TransportStats>>,
     name: String,
 }
 
-impl ArcTransport {
+impl ArcFrameTransport {
+    /// Create a pair of connected transports.
     pub fn create_pair(name: impl Into<String>) -> TransportResult<(Self, Self)> {
         let name = name.into();
 
@@ -40,9 +56,11 @@ impl ArcTransport {
 
         Ok((t1, t2))
     }
+}
 
+impl ZeroCopyTransport for ArcFrameTransport {
     /// Send typed data without serialization
-    pub fn send_typed<T: Send + Sync + 'static>(&self, data: T) -> TransportResult<()> {
+    fn send_typed<T: Send + Sync + 'static>(&self, data: T) -> TransportResult<()> {
         let arc_data = Arc::new(data) as Arc<dyn Any + Send + Sync>;
         self.sender
             .send(arc_data)
@@ -56,7 +74,7 @@ impl ArcTransport {
     }
 
     /// Receive typed data without deserialization
-    pub fn recv_typed<T: Send + Sync + 'static>(&self) -> TransportResult<Arc<T>> {
+    fn recv_typed<T: Send + Sync + 'static>(&self) -> TransportResult<Arc<T>> {
         let data = self
             .receiver
             .recv()
@@ -72,7 +90,7 @@ impl ArcTransport {
     }
 
     /// Try receive with timeout
-    pub fn recv_typed_timeout<T: Send + Sync + 'static>(
+    fn recv_typed_timeout<T: Send + Sync + 'static>(
         &self,
         timeout: Duration,
     ) -> TransportResult<Option<Arc<T>>> {
@@ -94,13 +112,13 @@ impl ArcTransport {
 }
 
 #[async_trait]
-impl Transport for ArcTransport {
-    async fn send(&self, data: &[u8]) -> TransportResult<()> {
+impl FrameTransport for ArcFrameTransport {
+    async fn send_frame(&self, data: &[u8]) -> TransportResult<()> {
         let vec = data.to_vec();
         self.send_typed(vec)
     }
 
-    async fn recv(&self) -> TransportResult<Bytes> {
+    async fn recv_frame(&self) -> TransportResult<Bytes> {
         let arc_vec = self.recv_typed::<Vec<u8>>()?;
         Ok(Bytes::from((*arc_vec).clone()))
     }
@@ -122,13 +140,17 @@ impl Transport for ArcTransport {
     }
 }
 
-impl std::fmt::Debug for ArcTransport {
+impl std::fmt::Debug for ArcFrameTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArcTransport")
+        f.debug_struct("ArcFrameTransport")
             .field("name", &self.name)
             .finish()
     }
 }
+
+// Deprecated alias for backward compatibility
+#[deprecated(since = "0.2.0", note = "Use ArcFrameTransport instead")]
+pub type ArcTransport = ArcFrameTransport;
 
 #[cfg(test)]
 mod tests {
@@ -142,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_zero_copy_basic() {
-        let (t1, t2) = ArcTransport::create_pair("test").unwrap();
+        let (t1, t2) = ArcFrameTransport::create_pair("test").unwrap();
 
         let data = TestData {
             value: 42,
@@ -157,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_zero_copy_arc_sharing() {
-        let (t1, t2) = ArcTransport::create_pair("test").unwrap();
+        let (t1, t2) = ArcFrameTransport::create_pair("test").unwrap();
 
         let data = vec![1, 2, 3, 4, 5];
         t1.send_typed(data.clone()).unwrap();
@@ -167,11 +189,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_transport_trait_compat() {
-        let (t1, t2) = ArcTransport::create_pair("test").unwrap();
+    async fn test_frame_transport_compat() {
+        let (t1, t2) = ArcFrameTransport::create_pair("test").unwrap();
 
-        t1.send(b"test").await.unwrap();
-        let received = t2.recv().await.unwrap();
+        t1.send_frame(b"test").await.unwrap();
+        let received = t2.recv_frame().await.unwrap();
 
         assert_eq!(received.as_ref(), b"test");
     }

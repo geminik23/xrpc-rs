@@ -1,21 +1,22 @@
+//! Strongly-typed bidirectional channel (Layer 2).
+
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 
 use crate::codec::{BincodeCodec, Codec};
 use crate::error::TransportResult;
-use crate::transport::Transport;
+use crate::transport::FrameTransport;
 
-/// A strongly typed channel that sends and receives specific types using a configurable codec.
-/// This abstraction sits on top of any `Transport` and handles serialization/deserialization.
-pub struct TypedChannel<Req, Resp, T: Transport, C: Codec = BincodeCodec> {
-    transport: T,
+/// Strongly-typed channel with fixed request/response types (Layer 2).
+pub struct TypedChannel<Req, Resp, F: FrameTransport, C: Codec = BincodeCodec> {
+    transport: F,
     codec: C,
     _phantom: PhantomData<(Req, Resp)>,
 }
 
-impl<Req, Resp, T: Transport> TypedChannel<Req, Resp, T, BincodeCodec> {
-    /// Create a new TypedChannel with default Bincode codec
-    pub fn new(transport: T) -> Self {
+impl<Req, Resp, F: FrameTransport> TypedChannel<Req, Resp, F, BincodeCodec> {
+    /// Create a new TypedChannel with default BincodeCodec.
+    pub fn new(transport: F) -> Self {
         Self {
             transport,
             codec: BincodeCodec,
@@ -24,9 +25,9 @@ impl<Req, Resp, T: Transport> TypedChannel<Req, Resp, T, BincodeCodec> {
     }
 }
 
-impl<Req, Resp, T: Transport, C: Codec> TypedChannel<Req, Resp, T, C> {
-    /// Create a new TypedChannel with a specific codec
-    pub fn with_codec(transport: T, codec: C) -> Self {
+impl<Req, Resp, F: FrameTransport, C: Codec> TypedChannel<Req, Resp, F, C> {
+    /// Create a new TypedChannel with a specific codec.
+    pub fn with_codec(transport: F, codec: C) -> Self {
         Self {
             transport,
             codec,
@@ -34,7 +35,7 @@ impl<Req, Resp, T: Transport, C: Codec> TypedChannel<Req, Resp, T, C> {
         }
     }
 
-    /// Send a request
+    /// Send a request.
     pub async fn send(&self, request: &Req) -> TransportResult<()>
     where
         Req: Serialize,
@@ -43,29 +44,27 @@ impl<Req, Resp, T: Transport, C: Codec> TypedChannel<Req, Resp, T, C> {
             .codec
             .encode(request)
             .map_err(|e| crate::error::TransportError::Protocol(e.to_string()))?;
-        self.transport.send(&data).await
+        self.transport.send_frame(&data).await
     }
 
-    /// Receive a response
+    /// Receive a response.
     pub async fn recv(&self) -> TransportResult<Resp>
     where
         Resp: for<'de> Deserialize<'de>,
     {
-        let bytes = self.transport.recv().await?;
-        let data = self
-            .codec
+        let bytes = self.transport.recv_frame().await?;
+        self.codec
             .decode(&bytes)
-            .map_err(|e| crate::error::TransportError::Protocol(e.to_string()))?;
-        Ok(data)
+            .map_err(|e| crate::error::TransportError::Protocol(e.to_string()))
     }
 
-    /// Get reference to underlying transport
-    pub fn transport(&self) -> &T {
+    /// Get a reference to the inner transport.
+    pub fn transport(&self) -> &F {
         &self.transport
     }
 
-    /// Consumes the TypedChannel and returns the underlying transport
-    pub fn into_inner(self) -> T {
+    /// Consume the channel and return the inner transport.
+    pub fn into_inner(self) -> F {
         self.transport
     }
 }
@@ -74,7 +73,7 @@ impl<Req, Resp, T: Transport, C: Codec> TypedChannel<Req, Resp, T, C> {
 mod tests {
     use super::*;
     use crate::codec::JsonCodec;
-    use crate::transport::channel::{ChannelConfig, ChannelTransport};
+    use crate::transport::channel::{ChannelConfig, ChannelFrameTransport};
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct TestRequest {
@@ -90,7 +89,7 @@ mod tests {
     #[tokio::test]
     async fn test_typed_channel_bincode() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
 
         let ch1: TypedChannel<TestRequest, TestResponse, _> = TypedChannel::new(t1);
         let ch2: TypedChannel<TestResponse, TestRequest, _> = TypedChannel::new(t2);
@@ -113,7 +112,7 @@ mod tests {
     #[tokio::test]
     async fn test_typed_channel_json() {
         let config = ChannelConfig::default();
-        let (t1, t2) = ChannelTransport::create_pair("test_json", config).unwrap();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test_json", config).unwrap();
 
         let ch1 = TypedChannel::<TestRequest, TestResponse, _, _>::with_codec(t1, JsonCodec);
         let ch2 = TypedChannel::<TestResponse, TestRequest, _, _>::with_codec(t2, JsonCodec);
@@ -124,7 +123,6 @@ mod tests {
         };
 
         ch1.send(&req).await.unwrap();
-
         let received: TestRequest = ch2.recv().await.unwrap();
         assert_eq!(received, req);
     }
