@@ -262,7 +262,7 @@ impl SharedMemoryRingBuffer {
         }
     }
 
-    fn write(&self, data: &[u8]) -> TransportResult<()> {
+    fn write(&self, data: &[u8], timeout: Duration) -> TransportResult<()> {
         let control = unsafe { &*self.control };
 
         if !control.is_valid() {
@@ -284,7 +284,6 @@ impl SharedMemoryRingBuffer {
         }
 
         let start = Instant::now();
-        let timeout = Duration::from_secs(5);
 
         // Wait for space
         loop {
@@ -350,7 +349,7 @@ impl SharedMemoryRingBuffer {
         }
     }
 
-    fn read(&self) -> TransportResult<Bytes> {
+    fn read(&self, timeout: Duration) -> TransportResult<Bytes> {
         let control = unsafe { &*self.control };
 
         if !control.is_valid() {
@@ -361,7 +360,6 @@ impl SharedMemoryRingBuffer {
         }
 
         let start = Instant::now();
-        let timeout = Duration::from_secs(5);
 
         // Wait for data (at least 4 bytes for length)
         loop {
@@ -748,7 +746,8 @@ impl Transport for SharedMemoryTransport {
             let result = tokio::task::spawn_blocking({
                 let buffer = self.send_buffer.load_full();
                 let data = data.to_vec();
-                move || buffer.write(&data)
+                let timeout = self.config.write_timeout.unwrap_or(Duration::from_secs(30));
+                move || buffer.write(&data, timeout)
             })
             .await;
 
@@ -795,7 +794,8 @@ impl Transport for SharedMemoryTransport {
 
             let result = tokio::task::spawn_blocking({
                 let buffer = self.recv_buffer.load_full();
-                move || buffer.read()
+                let timeout = self.config.read_timeout.unwrap_or(Duration::from_secs(30));
+                move || buffer.read(timeout)
             })
             .await;
 
@@ -911,5 +911,29 @@ mod tests {
 
         let msg = server.recv().await.unwrap();
         assert_eq!(msg.as_ref(), b"after");
+    }
+
+    #[tokio::test]
+    async fn test_configurable_timeout() {
+        // Use short timeout to verify config is respected
+        let config = SharedMemoryConfig::default()
+            .with_read_timeout(Duration::from_millis(100))
+            .with_write_timeout(Duration::from_millis(100));
+
+        let _server = SharedMemoryTransport::create_server("test-timeout", config.clone()).unwrap();
+        let client =
+            SharedMemoryTransport::connect_client_with_config("test-timeout", config).unwrap();
+
+        // recv should timeout quickly since no data is sent
+        let start = Instant::now();
+        let result = client.recv().await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "timeout took too long: {:?}",
+            elapsed
+        );
     }
 }
