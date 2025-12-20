@@ -8,7 +8,7 @@ High-performance local IPC library for Rust with seamless transport flexibility.
 
 Start with in-process channels for development, scale to shared memory for production IPC, extend to TCP for network deployment—same interface.
 
-**Status:** Early prototype - working but not production-ready.
+**Status:** Alpha - core features complete, API may change.
 
 ## Quick Start
 
