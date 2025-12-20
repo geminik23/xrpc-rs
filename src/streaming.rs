@@ -99,12 +99,11 @@ impl<T: MessageTransport, C: Codec> StreamSender<T, C> {
     }
 }
 
+/// Receives stream chunks. Assumes transport delivers messages in order.
 pub struct StreamReceiver<D, C: Codec = BincodeCodec> {
     stream_id: StreamId,
     rx: mpsc::UnboundedReceiver<Result<Bytes>>,
     ended: bool,
-    buffer: HashMap<u64, Bytes>,
-    next_sequence: u64,
     codec: C,
     _phantom: std::marker::PhantomData<D>,
 }
@@ -123,8 +122,6 @@ where
             stream_id,
             rx,
             ended: false,
-            buffer: HashMap::new(),
-            next_sequence: 0,
             codec,
             _phantom: std::marker::PhantomData,
         }
@@ -141,11 +138,6 @@ where
     pub async fn recv(&mut self) -> Option<Result<D>> {
         if self.ended {
             return None;
-        }
-
-        if let Some(data) = self.buffer.remove(&self.next_sequence) {
-            self.next_sequence += 1;
-            return Some(self.codec.decode(&data));
         }
 
         match self.rx.recv().await {
