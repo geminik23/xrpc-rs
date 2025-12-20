@@ -82,8 +82,19 @@ where
             while running.load(Ordering::Acquire) {
                 match transport.recv().await {
                     Ok(message) => match message.msg_type {
-                        MessageType::Reply | MessageType::Error => {
+                        MessageType::Reply => {
                             if let Some(tx) = pending.lock().remove(&message.id) {
+                                let _ = tx.send(Ok(message));
+                            }
+                        }
+                        MessageType::Error => {
+                            // Route stream errors to StreamManager, others to pending
+                            if let Some(stream_id) = message.metadata.stream_id {
+                                let error_msg: String = BincodeCodec
+                                    .decode(&message.payload)
+                                    .unwrap_or_else(|_| "Unknown error".to_string());
+                                stream_manager.send_error(stream_id, error_msg);
+                            } else if let Some(tx) = pending.lock().remove(&message.id) {
                                 let _ = tx.send(Ok(message));
                             }
                         }
@@ -370,6 +381,39 @@ mod tests {
         }
 
         assert_eq!(items, vec![1, 2, 3]);
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_stream_error() {
+        let config = ChannelConfig::default();
+        let (t1, t2) = ChannelTransport::create_pair("test", config).unwrap();
+
+        let client_transport = MessageTransportAdapter::new(t1);
+        let server_transport = MessageTransportAdapter::new(t2);
+
+        let client = RpcClient::new(client_transport);
+        let _handle = client.start();
+
+        // Server sends error with stream_id
+        let server_handle = tokio::spawn(async move {
+            let msg = server_transport.recv().await.unwrap();
+            let stream_id = msg.metadata.stream_id.unwrap();
+
+            let error: Message = Message::stream_error(msg.id, stream_id, "method not found");
+            server_transport.send(&error).await.unwrap();
+        });
+
+        let mut stream: StreamReceiver<i32> = client
+            .call_server_stream("unknown_method", &())
+            .await
+            .unwrap();
+
+        // Should receive error, not hang
+        let result = stream.recv().await;
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+
         server_handle.await.unwrap();
     }
 }

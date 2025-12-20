@@ -384,8 +384,9 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let handler = self.stream_handlers.read().get(&message.method).cloned();
 
         let Some(h) = handler else {
-            let error = Message::error(
+            let error = Message::stream_error(
                 message.id,
+                stream_id,
                 format!("Stream method not found: {}", message.method),
             );
             let _ = transport.send(&error).await;
@@ -406,7 +407,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let codec = self.codec.clone();
         let handler_task = async {
             if let Err(e) = h.handle(message.clone(), sender, &codec).await {
-                let error = Message::error(message.id, e.to_string());
+                let error = Message::stream_error(message.id, stream_id, e.to_string());
                 let _ = transport.send(&error).await;
             }
         };

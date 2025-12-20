@@ -81,8 +81,6 @@ impl<C: Codec + Default> Message<C> {
 
     pub fn error(id: MessageId, error_msg: impl Into<String>) -> Self {
         let error_msg = error_msg.into();
-        // Errors are always simple strings, we use the codec to serialize them
-        // fallback to empty if serialization fails (shouldn't happen for string)
         let codec = C::default();
         let payload = codec.encode(&error_msg).unwrap_or_default();
         Self {
@@ -91,6 +89,21 @@ impl<C: Codec + Default> Message<C> {
             method: String::new(),
             payload: Bytes::from(payload),
             metadata: MessageMetadata::new(),
+            codec,
+        }
+    }
+
+    /// Create an error message with stream_id for stream call failures
+    pub fn stream_error(id: MessageId, stream_id: u64, error_msg: impl Into<String>) -> Self {
+        let error_msg = error_msg.into();
+        let codec = C::default();
+        let payload = codec.encode(&error_msg).unwrap_or_default();
+        Self {
+            id,
+            msg_type: MessageType::Error,
+            method: String::new(),
+            payload: Bytes::from(payload),
+            metadata: MessageMetadata::new().with_stream(stream_id, 0),
             codec,
         }
     }
@@ -236,10 +249,13 @@ impl<C: Codec> Message<C> {
         // Version
         buf.put_u8(VERSION);
 
-        // Flags
+        // Flags - set streaming for stream messages
         let flags = MessageFlags {
             compressed: self.metadata.compression != CompressionType::None,
-            streaming: false,
+            streaming: matches!(
+                self.msg_type,
+                MessageType::StreamChunk | MessageType::StreamEnd
+            ),
             batch: false,
         };
         buf.put_u8(flags.to_u8());
@@ -391,5 +407,26 @@ mod tests {
 
         assert_eq!(decoded.metadata.timeout_ms, Some(1000));
         assert_eq!(decoded.metadata.compression, CompressionType::Lz4);
+    }
+
+    #[test]
+    fn test_streaming_flag() {
+        // StreamChunk should have streaming flag set
+        let chunk = Message::<BincodeCodec>::stream_chunk(1, 0, 42i32).unwrap();
+        let buf = chunk.encode().unwrap();
+        let flags = MessageFlags::from_u8(buf[5]); // byte 5 is flags
+        assert!(flags.streaming, "StreamChunk should have streaming flag");
+
+        // StreamEnd should have streaming flag set
+        let end = Message::<BincodeCodec>::stream_end(1);
+        let buf = end.encode().unwrap();
+        let flags = MessageFlags::from_u8(buf[5]);
+        assert!(flags.streaming, "StreamEnd should have streaming flag");
+
+        // Call should not have streaming flag
+        let call = Message::<BincodeCodec>::call("test", ()).unwrap();
+        let buf = call.encode().unwrap();
+        let flags = MessageFlags::from_u8(buf[5]);
+        assert!(!flags.streaming, "Call should not have streaming flag");
     }
 }
