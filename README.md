@@ -60,13 +60,13 @@ xrpc-rs = { version = "0.2", features = ["codec-messagepack"] }
 
 | Feature | Status |
 |---------|--------|
-| FrameTransport Layer (TCP, Unix, SharedMemory, Channel) | Completed |
-| MessageChannel with compression | Completed |
-| RPC Client/Server | Completed |
-| Streaming | Completed |
-| Connection Pooling | Completed |
-| Batching | Planned |
-| Service Discovery & Load Balancing | Planned |
+| FrameTransport Layer (TCP, Unix, SharedMemory, Channel) | ✅ Completed |
+| MessageChannel with compression | ✅ Completed |
+| RPC Client/Server | ✅ Completed |
+| Streaming | ✅ Completed |
+| Connection Pooling | ✅ Completed |
+| Service Discovery & Load Balancing | ✅ Completed |
+| Docs | Pending |
 
 ## Architecture
 
@@ -77,10 +77,12 @@ xRPC follows a layered architecture:
 | Layer 1 | `FrameTransport` | Low-level byte transmission with framing |
 | Layer 2 | `MessageChannel` | Message-aware channel with compression |
 | Layer 3 | `RpcClient/RpcServer` | RPC with method dispatch, streaming |
-| Layer 4 | Advanced | Batching, service discovery, load balancing |
+| Layer 4 | `LoadBalancer` | Service discovery, load balancing |
 
 ```
 Application
+    ↓
+LoadBalancedClient (Layer 4)
     ↓
 RpcClient/RpcServer (Layer 3)
     ↓
@@ -101,9 +103,62 @@ Network/IPC
 | `ChannelFrameTransport` | Same-process / Testing | No | Yes |
 | `ArcFrameTransport` | Same-process fast path | No | No (zero-copy) |
 
+## Load Balancing
+
+Distribute requests across multiple server instances:
+
+```rust
+use xrpc::{
+    LoadBalancedClient, LoadBalancer, ClientFactory, Endpoint,
+    StaticDiscovery, RoundRobin, RpcClient, MessageChannelAdapter,
+    TcpFrameTransport, TcpConfig, BincodeCodec, RpcError,
+};
+use async_trait::async_trait;
+use std::sync::Arc;
+
+struct TcpFactory;
+
+#[async_trait]
+impl ClientFactory<MessageChannelAdapter<TcpFrameTransport>, BincodeCodec> for TcpFactory {
+    async fn create(&self, endpoint: &Endpoint) 
+        -> Result<RpcClient<MessageChannelAdapter<TcpFrameTransport>, BincodeCodec>, RpcError> 
+    {
+        let Endpoint::Tcp(addr) = endpoint else {
+            return Err(RpcError::ClientError("Expected TCP".into()));
+        };
+        let transport = TcpFrameTransport::connect(*addr, TcpConfig::default())
+            .await.map_err(RpcError::Transport)?;
+        Ok(RpcClient::new(MessageChannelAdapter::new(transport)))
+    }
+}
+
+// Setup load balancer
+let endpoints = vec![
+    Endpoint::tcp_from_str("127.0.0.1:8001")?,
+    Endpoint::tcp_from_str("127.0.0.1:8002")?,
+    Endpoint::tcp_from_str("127.0.0.1:8003")?,
+];
+
+let discovery = Arc::new(StaticDiscovery::new(endpoints));
+let lb = Arc::new(LoadBalancer::new(discovery, RoundRobin::new()));
+let client = LoadBalancedClient::new(lb, Arc::new(TcpFactory));
+client.init().await?;
+
+// Calls automatically distributed across servers with failover
+let response: Response = client.call("method", &request).await?;
+```
+
+**Strategies:** `RoundRobin`, `Random`, `LeastConnections`, `WeightedRoundRobin`, `ScoreBased`
+
+**Features:**
+- Automatic failover on server failure
+- Stream affinity (streaming calls stay on same server)
+- Health tracking with configurable failure thresholds
+- DNS-based discovery with refresh
+
 ## Documentation
 
-- [Message Protocol](./docs/message.md) - Binary message format specification
+- [Message Protocol](./docs/message.md) - Binary message format
 
 ## Examples
 
@@ -115,6 +170,12 @@ cargo run --example rpc_client_server -- server
 
 # Terminal 2
 cargo run --example rpc_client_server -- client
+```
+
+### Load Balancing
+
+```bash
+cargo run --example load_balancing
 ```
 
 ### SharedMemory Transport

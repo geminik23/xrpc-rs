@@ -1,6 +1,6 @@
 [package]
 name = "xrpc-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 description = "async RPC library optimized for shared memory communication"
@@ -38,6 +38,9 @@ raw_sync = "0.1"
 lz4 = "1.24"
 zstd = "0.13"
 serde_json = "1.0.145"
+
+# Load balancing
+rand = "0.8"
 
 [features]
 default = []

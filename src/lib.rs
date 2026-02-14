@@ -3,7 +3,10 @@
 pub mod channel;
 pub mod client;
 pub mod codec;
+pub mod discovery;
 pub mod error;
+pub mod lb_client;
+pub mod loadbalancer;
 pub mod message;
 pub mod pool;
 pub mod server;
@@ -33,6 +36,14 @@ pub use server::{
     StreamHandler, TypedHandler, TypedStreamHandler,
 };
 pub use streaming::{StreamId, StreamManager, StreamReceiver, StreamSender, next_stream_id};
+
+// Layer 4: Discovery & Load Balancing
+pub use discovery::{DiscoveryEvent, DnsDiscovery, Endpoint, ServiceDiscovery, StaticDiscovery};
+pub use lb_client::{ClientFactory, LoadBalancedClient};
+pub use loadbalancer::{
+    LeastConnections, LoadBalanceStrategy, LoadBalancer, LoadBalancerConfig, LoadBalancerHandle,
+    Random, RoundRobin, ScoreBased, ServerHealth, ServerState, ServerWeight, WeightedRoundRobin,
+};
 
 // Codec
 #[cfg(feature = "codec-cbor")]
