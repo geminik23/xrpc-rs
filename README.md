@@ -66,7 +66,7 @@ xrpc-rs = { version = "0.2", features = ["codec-messagepack"] }
 | Streaming | ✅ Completed |
 | Connection Pooling | ✅ Completed |
 | Service Discovery & Load Balancing | ✅ Completed |
-| Docs | Pending |
+| Docs & Examples | In Progress |
 
 ## Architecture
 
@@ -160,6 +160,14 @@ let response: Response = client.call("method", &request).await?;
 
 - [Message Protocol](./docs/message.md) - Binary message format
 
+**Planned:**
+- Transport layer guide
+- Client/Server usage guide
+- Streaming guide
+- Discovery & load balancing guide
+- Codec guide (Bincode, JSON, MessagePack, CBOR, Postcard)
+- Architecture overview & getting started
+
 ## Examples
 
 ### RPC Client/Server
@@ -193,6 +201,11 @@ cargo run --example message_transport_shm -- client
 ```bash
 cargo run --example byte_transports
 ```
+
+**Planned:**
+- `examples/streaming.rs` - Server streaming RPC
+- `examples/compression.rs` - LZ4/Zstd compression
+- `examples/custom_codec.rs` - JSON/MessagePack codec usage
 
 ## License
 
