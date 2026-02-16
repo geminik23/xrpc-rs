@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-02-16
+
+### Changed
+
+**Concurrent Serve Loop**
+
+- `RpcServer::serve()` now dispatches each incoming message in its own tokio task instead of processing sequentially. This enables:
+  - Multiple streams running simultaneously on the same connection
+  - Unary RPCs processed while streams are active
+  - Multiple unary RPCs executing concurrently
+- All outbound messages are serialized through a single send queue, ensuring safe writes for all transport types (including SharedMemory)
+
 ## [0.2.1] - 2026-02-09
 
 ### Added

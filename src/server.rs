@@ -344,44 +344,52 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         self.stream_handlers.write().insert(method, handler);
     }
 
-    pub async fn handle_message<T: MessageChannel<C>>(
-        &self,
+    /// Dispatch a single message, sending responses via `send_tx`.
+    async fn dispatch_message(
+        handlers: &Arc<RwLock<HashMap<String, Arc<dyn Handler<C>>>>>,
+        stream_handlers: &Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>,
+        codec: &C,
         message: Message<C>,
-        transport: &T,
-    ) -> Option<Message<C>> {
+        send_tx: &mpsc::UnboundedSender<Message<C>>,
+    ) {
         match message.msg_type {
             MessageType::Call => {
                 if message.metadata.stream_id.is_some() {
-                    self.handle_stream_call(message, transport).await;
-                    return None;
+                    Self::dispatch_stream_call(stream_handlers, codec, message, send_tx).await;
+                    return;
                 }
 
-                let handler = self.handlers.read().get(&message.method).cloned();
-                match handler {
-                    Some(h) => match h.handle(message.clone(), &self.codec).await {
-                        Ok(response) => Some(response),
-                        Err(e) => Some(Message::error(message.id, e.to_string())),
+                let handler = handlers.read().get(&message.method).cloned();
+                let response = match handler {
+                    Some(h) => match h.handle(message.clone(), codec).await {
+                        Ok(response) => response,
+                        Err(e) => Message::error(message.id, e.to_string()),
                     },
-                    None => Some(Message::error(
-                        message.id,
-                        format!("Method not found: {}", message.method),
-                    )),
-                }
+                    None => {
+                        Message::error(message.id, format!("Method not found: {}", message.method))
+                    }
+                };
+                let _ = send_tx.send(response);
             }
             MessageType::Notification => {
-                let handler = self.handlers.read().get(&message.method).cloned();
+                let handler = handlers.read().get(&message.method).cloned();
                 if let Some(h) = handler {
-                    let _ = h.handle(message, &self.codec).await;
+                    let _ = h.handle(message, codec).await;
                 }
-                None
             }
-            _ => None,
+            _ => {}
         }
     }
 
-    async fn handle_stream_call<T: MessageChannel<C>>(&self, message: Message<C>, transport: &T) {
+    /// Dispatch a streaming call, forwarding all chunks via `send_tx`.
+    async fn dispatch_stream_call(
+        stream_handlers: &Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>,
+        codec: &C,
+        message: Message<C>,
+        send_tx: &mpsc::UnboundedSender<Message<C>>,
+    ) {
         let stream_id = message.metadata.stream_id.unwrap_or_else(next_stream_id);
-        let handler = self.stream_handlers.read().get(&message.method).cloned();
+        let handler = stream_handlers.read().get(&message.method).cloned();
 
         let Some(h) = handler else {
             let error = Message::stream_error(
@@ -389,43 +397,107 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
                 stream_id,
                 format!("Stream method not found: {}", message.method),
             );
-            let _ = transport.send(&error).await;
+            let _ = send_tx.send(error);
             return;
         };
 
         let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
-        let sender = ServerStreamSender::new(stream_id, tx, self.codec.clone());
+        let sender = ServerStreamSender::new(stream_id, tx, codec.clone());
 
-        let transport_send = async {
+        let send_tx_clone = send_tx.clone();
+        let forward_task = async move {
             while let Some(data) = rx.recv().await {
                 if let Ok(msg) = Message::<C>::decode(&data[..]) {
-                    let _ = transport.send(&msg).await;
+                    let _ = send_tx_clone.send(msg);
                 }
             }
         };
 
-        let codec = self.codec.clone();
+        let codec = codec.clone();
         let handler_task = async {
             if let Err(e) = h.handle(message.clone(), sender, &codec).await {
                 let error = Message::stream_error(message.id, stream_id, e.to_string());
-                let _ = transport.send(&error).await;
+                let _ = send_tx.send(error);
             }
         };
 
-        tokio::join!(handler_task, transport_send);
+        tokio::join!(handler_task, forward_task);
     }
 
-    pub async fn serve<T: MessageChannel<C>>(&self, transport: Arc<T>) -> Result<()> {
-        loop {
-            let message = transport.recv().await.map_err(RpcError::Transport)?;
+    /// Serve requests concurrently, dispatching each message in its own tokio task.
+    pub async fn serve<T: MessageChannel<C> + 'static>(&self, transport: Arc<T>) -> Result<()> {
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Message<C>>();
 
-            if let Some(response) = self.handle_message(message, transport.as_ref()).await {
-                transport
-                    .send(&response)
-                    .await
-                    .map_err(RpcError::Transport)?;
+        let transport_writer = transport.clone();
+        let writer_handle = tokio::spawn(async move {
+            while let Some(msg) = send_rx.recv().await {
+                if transport_writer.send(&msg).await.is_err() {
+                    break;
+                }
             }
-        }
+        });
+
+        let result = loop {
+            let message = match transport.recv().await {
+                Ok(msg) => msg,
+                Err(e) => break Err(RpcError::Transport(e)),
+            };
+
+            let handlers = self.handlers.clone();
+            let stream_handlers = self.stream_handlers.clone();
+            let codec = self.codec.clone();
+            let send_tx = send_tx.clone();
+
+            tokio::spawn(async move {
+                Self::dispatch_message(&handlers, &stream_handlers, &codec, message, &send_tx)
+                    .await;
+            });
+        };
+
+        drop(send_tx);
+        let _ = writer_handle.await;
+
+        result
+    }
+
+    /// Serve requests sequentially, processing one message at a time.
+    ///
+    /// This preserves strict one-at-a-time message processing for cases where ordering guarantees or single-threaded handler execution is required.
+    pub async fn serve_sequential<T: MessageChannel<C> + 'static>(
+        &self,
+        transport: Arc<T>,
+    ) -> Result<()> {
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Message<C>>();
+
+        let transport_writer = transport.clone();
+        let writer_handle = tokio::spawn(async move {
+            while let Some(msg) = send_rx.recv().await {
+                if transport_writer.send(&msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = loop {
+            let message = match transport.recv().await {
+                Ok(msg) => msg,
+                Err(e) => break Err(RpcError::Transport(e)),
+            };
+
+            Self::dispatch_message(
+                &self.handlers,
+                &self.stream_handlers,
+                &self.codec,
+                message,
+                &send_tx,
+            )
+            .await;
+        };
+
+        drop(send_tx);
+        let _ = writer_handle.await;
+
+        result
     }
 
     pub fn spawn_handler<T: MessageChannel<C> + 'static>(&self, transport: T) -> ServerHandle {
@@ -595,5 +667,151 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_unary_during_stream() {
+        let config = ChannelConfig::default();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
+
+        let server = RpcServer::new();
+        server.register_stream_fn(
+            "slow_stream",
+            |_msg: Message, sender: ServerStreamSender<BincodeCodec>| async move {
+                for i in 0..5 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    sender.send(i as i32)?;
+                }
+                sender.end()?;
+                Ok(())
+            },
+        );
+        server.register_typed("add", |req: AddRequest| async move {
+            Ok(AddResponse {
+                result: req.a + req.b,
+            })
+        });
+
+        let _handle = server.spawn_handler(server_channel);
+
+        let client = crate::client::RpcClient::new(client_channel);
+        let _client_handle = client.start();
+
+        let mut stream: StreamReceiver<i32> =
+            client.call_server_stream("slow_stream", &()).await.unwrap();
+
+        let response: AddResponse = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call("add", &AddRequest { a: 10, b: 32 }),
+        )
+        .await
+        .expect("Unary call should not be blocked by active stream")
+        .unwrap();
+        assert_eq!(response.result, 42);
+
+        let mut items = Vec::new();
+        while let Some(result) = stream.recv().await {
+            items.push(result.unwrap());
+        }
+        assert_eq!(items, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_multiple_concurrent_streams() {
+        let config = ChannelConfig::default();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
+
+        let server = RpcServer::new();
+        server.register_stream_fn(
+            "countdown",
+            |msg: Message, sender: ServerStreamSender<BincodeCodec>| async move {
+                let count: i32 = msg.deserialize_payload().unwrap_or(3);
+                for i in (0..count).rev() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    sender.send(i)?;
+                }
+                sender.end()?;
+                Ok(())
+            },
+        );
+
+        let _handle = server.spawn_handler(server_channel);
+
+        let client = crate::client::RpcClient::new(client_channel);
+        let _client_handle = client.start();
+
+        let mut stream_a: StreamReceiver<i32> =
+            client.call_server_stream("countdown", &3i32).await.unwrap();
+        let mut stream_b: StreamReceiver<i32> =
+            client.call_server_stream("countdown", &4i32).await.unwrap();
+
+        let (items_a, items_b) = tokio::join!(
+            async {
+                let mut items = Vec::new();
+                while let Some(result) = stream_a.recv().await {
+                    items.push(result.unwrap());
+                }
+                items
+            },
+            async {
+                let mut items = Vec::new();
+                while let Some(result) = stream_b.recv().await {
+                    items.push(result.unwrap());
+                }
+                items
+            }
+        );
+
+        assert_eq!(items_a, vec![2, 1, 0]);
+        assert_eq!(items_b, vec![3, 2, 1, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_unary_calls() {
+        let config = ChannelConfig::default();
+        let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(t1);
+        let server_channel = MessageChannelAdapter::new(t2);
+
+        let server = RpcServer::new();
+        server.register_typed("slow_add", |req: AddRequest| async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(AddResponse {
+                result: req.a + req.b,
+            })
+        });
+
+        let _handle = server.spawn_handler(server_channel);
+
+        let client = crate::client::RpcClient::new(client_channel);
+        let _client_handle = client.start();
+
+        let start = std::time::Instant::now();
+        let handles: Vec<_> = (0..5)
+            .map(|i| {
+                let client = &client;
+                async move {
+                    let resp: AddResponse = client
+                        .call("slow_add", &AddRequest { a: i, b: i * 10 })
+                        .await
+                        .unwrap();
+                    resp.result
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(handles).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(results, vec![0, 11, 22, 33, 44]);
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "Concurrent calls took {:?}, expected < 200ms",
+            elapsed
+        );
     }
 }
