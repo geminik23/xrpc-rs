@@ -207,6 +207,10 @@ cargo run --example byte_transports
 - `examples/compression.rs` - LZ4/Zstd compression
 - `examples/custom_codec.rs` - JSON/MessagePack codec usage
 
+## Used In
+
+- [quant-system](https://github.com/geminik23/quant-system) — A modular workspace for algorithmic trading — real-time market data, strategy execution, and analysis.
+
 ## License
 
 MIT License - see [LICENSE](./LICENSE) for details.
