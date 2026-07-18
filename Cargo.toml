@@ -1,7 +1,8 @@
 [package]
 name = "xrpc-rs"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.85"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 description = "async RPC library optimized for shared memory communication"
 license = "MIT"
@@ -11,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
+socket2 = "0.6"
 thiserror = "1.0"
 
 # Serialization
@@ -27,7 +29,6 @@ futures = "0.3"
 
 # Sync
 parking_lot = "0.12"
-crossbeam = "0.8"
 arc-swap = "1.7"
 
 # Shared Memory

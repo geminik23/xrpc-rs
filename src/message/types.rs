@@ -6,7 +6,7 @@ use crate::error::{Result, RpcError};
 pub const MAGIC: [u8; 4] = [0x58, 0x52, 0x50, 0x43]; // XRPC
 pub const VERSION: u8 = 1;
 pub const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024;
-pub const MIN_HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 1;
+pub const MIN_HEADER_SIZE: usize = 4 + 1 + 1 + 4 + 8 + 1 + 2 + 4 + 4;
 
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 

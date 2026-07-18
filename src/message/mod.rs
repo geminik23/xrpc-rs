@@ -12,6 +12,9 @@ use self::types::{
 use crate::codec::{BincodeCodec, Codec};
 use crate::error::{Result, TransportError, TransportResult};
 
+const FRAME_PREFIX_SIZE: usize = 4 + 1 + 1 + 4;
+const LEGACY_OMITTED_LENGTH_SIZE: usize = 2 + 4 + 4;
+
 #[derive(Debug, Clone)]
 pub struct Message<C: Codec = BincodeCodec> {
     pub id: MessageId,
@@ -30,27 +33,11 @@ impl<C: Codec + Default> Message<C> {
         payload: Bytes,
         metadata: MessageMetadata,
     ) -> Self {
-        Self {
-            id,
-            msg_type,
-            method: method.into(),
-            payload,
-            metadata,
-            codec: C::default(),
-        }
+        Self::new_with_codec(id, msg_type, method, payload, metadata, C::default())
     }
 
     pub fn call<T: Serialize>(method: impl Into<String>, request: T) -> Result<Self> {
-        let codec = C::default();
-        let payload = codec.encode(&request)?;
-        Ok(Self {
-            id: MessageId::new(),
-            msg_type: MessageType::Call,
-            method: method.into(),
-            payload: Bytes::from(payload),
-            metadata: MessageMetadata::new(),
-            codec,
-        })
+        Self::call_with_codec(method, request, C::default())
     }
 
     pub fn reply<T: Serialize>(id: MessageId, response: T) -> Result<Self> {
@@ -67,45 +54,16 @@ impl<C: Codec + Default> Message<C> {
     }
 
     pub fn notification<T: Serialize>(method: impl Into<String>, data: T) -> Result<Self> {
-        let codec = C::default();
-        let payload = codec.encode(&data)?;
-        Ok(Self {
-            id: MessageId::new(),
-            msg_type: MessageType::Notification,
-            method: method.into(),
-            payload: Bytes::from(payload),
-            metadata: MessageMetadata::new(),
-            codec,
-        })
+        Self::notification_with_codec(method, data, C::default())
     }
 
     pub fn error(id: MessageId, error_msg: impl Into<String>) -> Self {
-        let error_msg = error_msg.into();
-        let codec = C::default();
-        let payload = codec.encode(&error_msg).unwrap_or_default();
-        Self {
-            id,
-            msg_type: MessageType::Error,
-            method: String::new(),
-            payload: Bytes::from(payload),
-            metadata: MessageMetadata::new(),
-            codec,
-        }
+        Self::error_with_codec(id, error_msg, C::default())
     }
 
     /// Create an error message with stream_id for stream call failures
     pub fn stream_error(id: MessageId, stream_id: u64, error_msg: impl Into<String>) -> Self {
-        let error_msg = error_msg.into();
-        let codec = C::default();
-        let payload = codec.encode(&error_msg).unwrap_or_default();
-        Self {
-            id,
-            msg_type: MessageType::Error,
-            method: String::new(),
-            payload: Bytes::from(payload),
-            metadata: MessageMetadata::new().with_stream(stream_id, 0),
-            codec,
-        }
+        Self::stream_error_with_codec(id, stream_id, error_msg, C::default())
     }
 
     /// Create a stream chunk message
@@ -167,8 +125,25 @@ impl<C: Codec + Default> Message<C> {
         // Message length
         let msg_len = buf.get_u32_le() as usize;
 
-        if buf.remaining() < msg_len {
-            return Err(TransportError::Protocol("Incomplete message".to_string()));
+        let actual_body_len = buf.remaining();
+        let legacy_msg_len = actual_body_len.checked_sub(LEGACY_OMITTED_LENGTH_SIZE);
+        if msg_len != actual_body_len && legacy_msg_len != Some(msg_len) {
+            return Err(TransportError::Protocol(format!(
+                "Message length mismatch: declared {}, actual {}",
+                msg_len, actual_body_len
+            )));
+        }
+        let total_size = FRAME_PREFIX_SIZE.checked_add(actual_body_len).ok_or(
+            TransportError::MessageTooLarge {
+                size: usize::MAX,
+                max: MAX_MESSAGE_SIZE,
+            },
+        )?;
+        if total_size > MAX_MESSAGE_SIZE {
+            return Err(TransportError::MessageTooLarge {
+                size: total_size,
+                max: MAX_MESSAGE_SIZE,
+            });
         }
 
         // Message ID
@@ -180,18 +155,43 @@ impl<C: Codec + Default> Message<C> {
 
         // Method name
         let method_len = buf.get_u16_le() as usize;
+        if buf.remaining() < method_len {
+            return Err(TransportError::Protocol(
+                "Incomplete method name".to_string(),
+            ));
+        }
         let mut method_bytes = vec![0u8; method_len];
         buf.copy_to_slice(&mut method_bytes);
         let method = String::from_utf8(method_bytes)
             .map_err(|e| TransportError::Protocol(format!("Invalid method name: {}", e)))?;
 
         // Payload (compressed)
+        if buf.remaining() < std::mem::size_of::<u32>() {
+            return Err(TransportError::Protocol(
+                "Missing payload length".to_string(),
+            ));
+        }
         let payload_len = buf.get_u32_le() as usize;
+        if buf.remaining() < payload_len {
+            return Err(TransportError::Protocol("Incomplete payload".to_string()));
+        }
         let mut payload_bytes = vec![0u8; payload_len];
         buf.copy_to_slice(&mut payload_bytes);
 
         // Metadata
+        if buf.remaining() < std::mem::size_of::<u32>() {
+            return Err(TransportError::Protocol(
+                "Missing metadata length".to_string(),
+            ));
+        }
         let metadata_len = buf.get_u32_le() as usize;
+        if buf.remaining() != metadata_len {
+            return Err(TransportError::Protocol(format!(
+                "Metadata length mismatch: declared {}, remaining {}",
+                metadata_len,
+                buf.remaining()
+            )));
+        }
         let mut metadata_bytes = vec![0u8; metadata_len];
         buf.copy_to_slice(&mut metadata_bytes);
 
@@ -214,6 +214,87 @@ impl<C: Codec + Default> Message<C> {
 }
 
 impl<C: Codec> Message<C> {
+    pub(crate) fn error_with_codec(id: MessageId, error_msg: impl Into<String>, codec: C) -> Self {
+        let error_msg = error_msg.into();
+        let payload = codec.encode(&error_msg).unwrap_or_default();
+        Self {
+            id,
+            msg_type: MessageType::Error,
+            method: String::new(),
+            payload: Bytes::from(payload),
+            metadata: MessageMetadata::new(),
+            codec,
+        }
+    }
+
+    pub(crate) fn stream_error_with_codec(
+        id: MessageId,
+        stream_id: u64,
+        error_msg: impl Into<String>,
+        codec: C,
+    ) -> Self {
+        let error_msg = error_msg.into();
+        let payload = codec.encode(&error_msg).unwrap_or_default();
+        Self {
+            id,
+            msg_type: MessageType::Error,
+            method: String::new(),
+            payload: Bytes::from(payload),
+            metadata: MessageMetadata::new().with_stream(stream_id, 0),
+            codec,
+        }
+    }
+
+    pub(crate) fn new_with_codec(
+        id: MessageId,
+        msg_type: MessageType,
+        method: impl Into<String>,
+        payload: Bytes,
+        metadata: MessageMetadata,
+        codec: C,
+    ) -> Self {
+        Self {
+            id,
+            msg_type,
+            method: method.into(),
+            payload,
+            metadata,
+            codec,
+        }
+    }
+
+    pub(crate) fn call_with_codec<T: Serialize>(
+        method: impl Into<String>,
+        request: T,
+        codec: C,
+    ) -> Result<Self> {
+        let payload = codec.encode(&request)?;
+        Ok(Self::new_with_codec(
+            MessageId::new(),
+            MessageType::Call,
+            method,
+            Bytes::from(payload),
+            MessageMetadata::new(),
+            codec,
+        ))
+    }
+
+    pub(crate) fn notification_with_codec<T: Serialize>(
+        method: impl Into<String>,
+        data: T,
+        codec: C,
+    ) -> Result<Self> {
+        let payload = codec.encode(&data)?;
+        Ok(Self::new_with_codec(
+            MessageId::new(),
+            MessageType::Notification,
+            method,
+            Bytes::from(payload),
+            MessageMetadata::new(),
+            codec,
+        ))
+    }
+
     /// Encode message to bytes
     pub fn encode(&self) -> TransportResult<BytesMut> {
         let method_bytes = self.method.as_bytes();
@@ -231,8 +312,14 @@ impl<C: Codec> Message<C> {
             .map_err(|e| TransportError::Protocol(e.to_string()))?;
 
         // Calculate total size
-        let total_size =
-            MIN_HEADER_SIZE + method_len + payload_to_write.len() + metadata_bytes.len();
+        let total_size = MIN_HEADER_SIZE
+            .checked_add(method_len)
+            .and_then(|size| size.checked_add(payload_to_write.len()))
+            .and_then(|size| size.checked_add(metadata_bytes.len()))
+            .ok_or(TransportError::MessageTooLarge {
+                size: usize::MAX,
+                max: MAX_MESSAGE_SIZE,
+            })?;
 
         if total_size > MAX_MESSAGE_SIZE {
             return Err(TransportError::MessageTooLarge {
@@ -261,7 +348,7 @@ impl<C: Codec> Message<C> {
         buf.put_u8(flags.to_u8());
 
         // Total message length (excluding magic, version, flags, and length field)
-        let msg_len = total_size - 10;
+        let msg_len = total_size - FRAME_PREFIX_SIZE;
         buf.put_u32_le(msg_len as u32);
 
         // Message ID
@@ -366,6 +453,51 @@ mod tests {
 
         let decoded_resp: Response = decoded_reply.deserialize_payload().unwrap();
         assert_eq!(decoded_resp, resp);
+    }
+
+    #[test]
+    fn test_encoded_message_length_covers_complete_body() {
+        let message = Message::<BincodeCodec>::notification("event", 42u32).unwrap();
+        let encoded = message.encode().unwrap();
+        let declared = u32::from_le_bytes(encoded[6..10].try_into().unwrap()) as usize;
+
+        assert_eq!(declared, encoded.len() - FRAME_PREFIX_SIZE);
+    }
+
+    #[test]
+    fn test_decode_accepts_legacy_understated_message_length() {
+        let message = Message::<BincodeCodec>::notification("event", 42u32).unwrap();
+        let mut encoded = message.encode().unwrap();
+        let declared = u32::from_le_bytes(encoded[6..10].try_into().unwrap());
+        encoded[6..10]
+            .copy_from_slice(&(declared - LEGACY_OMITTED_LENGTH_SIZE as u32).to_le_bytes());
+
+        let decoded: Message = Message::decode(encoded.freeze()).unwrap();
+
+        assert_eq!(decoded.method, "event");
+    }
+
+    #[test]
+    fn test_decode_rejects_truncated_and_oversized_fields_without_panicking() {
+        let mut truncated = BytesMut::with_capacity(19);
+        truncated.put_slice(&MAGIC);
+        truncated.put_u8(VERSION);
+        truncated.put_u8(0);
+        truncated.put_u32_le(9);
+        truncated.put_u64_le(1);
+        truncated.put_u8(MessageType::Call.to_u8());
+        assert!(matches!(
+            Message::<BincodeCodec>::decode(truncated.freeze()),
+            Err(TransportError::Protocol(_))
+        ));
+
+        let message = Message::<BincodeCodec>::notification("event", 42u32).unwrap();
+        let mut oversized_method = message.encode().unwrap();
+        oversized_method[19..21].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            Message::<BincodeCodec>::decode(oversized_method.freeze()),
+            Err(TransportError::Protocol(_))
+        ));
     }
 
     #[test]

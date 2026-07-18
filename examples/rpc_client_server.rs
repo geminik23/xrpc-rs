@@ -88,7 +88,7 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
     let channel = MessageChannelAdapter::new(transport);
 
     let client = RpcClient::new(channel);
-    let _handle = client.start();
+    let handle = client.try_start()?;
 
     println!("[Client] Connected!\n");
 
@@ -121,7 +121,10 @@ async fn run_client() -> Result<(), Box<dyn std::error::Error>> {
         Err(e) => println!("[Client] Got expected error: {}\n", e),
     }
 
-    client.close().await?;
+    let close_result = client.close().await;
+    let join_result = handle.join().await;
+    close_result?;
+    join_result?;
     println!("[Client] Done!");
 
     Ok(())

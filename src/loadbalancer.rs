@@ -327,7 +327,7 @@ impl LoadBalanceStrategy for ScoreBased {
                 if s.last_update.elapsed() > self.stale_timeout {
                     return true;
                 }
-                s.status.map_or(true, |score| score < self.threshold)
+                s.status.is_none_or(|score| score < self.threshold)
             })
             .min_by(|(_, a), (_, b)| {
                 let a_stale = a.last_update.elapsed() > self.stale_timeout;
@@ -433,7 +433,7 @@ impl<S: LoadBalanceStrategy + 'static> LoadBalancer<S> {
         LoadBalancerHandle { handles }
     }
 
-    fn update_endpoints(&self, endpoints: Vec<Endpoint>) {
+    pub(crate) fn update_endpoints(&self, endpoints: Vec<Endpoint>) {
         Self::update_endpoints_static(&self.servers, endpoints);
     }
 
@@ -455,12 +455,22 @@ impl<S: LoadBalanceStrategy + 'static> LoadBalancer<S> {
         self.strategy.select(&servers)
     }
 
+    pub(crate) fn select_excluding(&self, excluded: &[usize]) -> Option<usize> {
+        let mut servers = self.servers.read().clone();
+        for server_idx in excluded {
+            if let Some(server) = servers.get_mut(*server_idx) {
+                server.health = ServerHealth::Unhealthy;
+            }
+        }
+        self.strategy.select(&servers)
+    }
+
     pub fn select_for_stream(&self, stream_id: StreamId) -> Option<usize> {
         {
             let affinity = self.stream_affinity.read();
             if let Some(&idx) = affinity.get(&stream_id) {
                 let servers = self.servers.read();
-                if servers.get(idx).map_or(false, |s| s.is_available()) {
+                if servers.get(idx).is_some_and(|s| s.is_available()) {
                     return Some(idx);
                 }
             }
@@ -557,6 +567,14 @@ impl<S: LoadBalanceStrategy + 'static> LoadBalancer<S> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn active_requests(&self, server_idx: usize) -> usize {
+        self.servers
+            .read()
+            .get(server_idx)
+            .map_or(0, |server| server.active_requests)
+    }
+
     pub fn config(&self) -> &LoadBalancerConfig {
         &self.config
     }
@@ -586,6 +604,20 @@ mod tests {
                 ServerState::new(Endpoint::tcp_from_str(&format!("127.0.0.1:800{}", i)).unwrap())
             })
             .collect()
+    }
+
+    struct StickyFirst;
+
+    impl LoadBalanceStrategy for StickyFirst {
+        type Status = ();
+
+        fn select(&self, servers: &[ServerState<Self::Status>]) -> Option<usize> {
+            servers.iter().position(ServerState::is_available)
+        }
+
+        fn name(&self) -> &'static str {
+            "StickyFirst"
+        }
     }
 
     #[test]
@@ -647,6 +679,22 @@ mod tests {
 
         assert_eq!(lb.server_count(), 2);
         assert_eq!(lb.available_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_select_excluding_guarantees_eligible_selection() {
+        let endpoints = vec![
+            Endpoint::tcp_from_str("127.0.0.1:8001").unwrap(),
+            Endpoint::tcp_from_str("127.0.0.1:8002").unwrap(),
+            Endpoint::tcp_from_str("127.0.0.1:8003").unwrap(),
+        ];
+        let discovery = Arc::new(StaticDiscovery::new(endpoints));
+        let lb = LoadBalancer::new(discovery, StickyFirst);
+        lb.init().await.unwrap();
+
+        assert_eq!(lb.select(), Some(0));
+        assert_eq!(lb.select_excluding(&[0, 2]), Some(1));
+        assert_eq!(lb.select_excluding(&[0, 1, 2]), None);
     }
 
     #[tokio::test]

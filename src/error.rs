@@ -1,6 +1,7 @@
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum RpcError {
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -30,7 +31,8 @@ pub enum RpcError {
     ConnectionClosed,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
 pub enum TransportError {
     #[error("Message too large: {size} bytes (max: {max})")]
     MessageTooLarge { size: usize, max: usize },
@@ -53,6 +55,9 @@ pub enum TransportError {
         attempts: usize,
         reason: String,
     },
+
+    #[error("Connection closed")]
+    ConnectionClosed,
 
     #[error("Not connected")]
     NotConnected,

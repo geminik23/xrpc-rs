@@ -33,6 +33,9 @@ pub trait StreamHandler<C: Codec>: Send + Sync {
     fn method_name(&self) -> &str;
 }
 
+type HandlerMap<C> = Arc<RwLock<HashMap<String, Arc<dyn Handler<C>>>>>;
+type StreamHandlerMap<C> = Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>;
+
 pub struct FnHandler<F, C> {
     method: String,
     func: Arc<F>,
@@ -271,8 +274,8 @@ where
 }
 
 pub struct RpcServer<C: Codec = BincodeCodec> {
-    handlers: Arc<RwLock<HashMap<String, Arc<dyn Handler<C>>>>>,
-    stream_handlers: Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>,
+    handlers: HandlerMap<C>,
+    stream_handlers: StreamHandlerMap<C>,
     codec: C,
 }
 
@@ -346,8 +349,8 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
 
     /// Dispatch a single message, sending responses via `send_tx`.
     async fn dispatch_message(
-        handlers: &Arc<RwLock<HashMap<String, Arc<dyn Handler<C>>>>>,
-        stream_handlers: &Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>,
+        handlers: &HandlerMap<C>,
+        stream_handlers: &StreamHandlerMap<C>,
         codec: &C,
         message: Message<C>,
         send_tx: &mpsc::UnboundedSender<Message<C>>,
@@ -363,11 +366,15 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
                 let response = match handler {
                     Some(h) => match h.handle(message.clone(), codec).await {
                         Ok(response) => response,
-                        Err(e) => Message::error(message.id, e.to_string()),
+                        Err(e) => {
+                            Message::error_with_codec(message.id, e.to_string(), codec.clone())
+                        }
                     },
-                    None => {
-                        Message::error(message.id, format!("Method not found: {}", message.method))
-                    }
+                    None => Message::error_with_codec(
+                        message.id,
+                        format!("Method not found: {}", message.method),
+                        codec.clone(),
+                    ),
                 };
                 let _ = send_tx.send(response);
             }
@@ -383,7 +390,7 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
 
     /// Dispatch a streaming call, forwarding all chunks via `send_tx`.
     async fn dispatch_stream_call(
-        stream_handlers: &Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>,
+        stream_handlers: &StreamHandlerMap<C>,
         codec: &C,
         message: Message<C>,
         send_tx: &mpsc::UnboundedSender<Message<C>>,
@@ -392,10 +399,11 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let handler = stream_handlers.read().get(&message.method).cloned();
 
         let Some(h) = handler else {
-            let error = Message::stream_error(
+            let error = Message::stream_error_with_codec(
                 message.id,
                 stream_id,
                 format!("Stream method not found: {}", message.method),
+                codec.clone(),
             );
             let _ = send_tx.send(error);
             return;
@@ -416,7 +424,12 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let codec = codec.clone();
         let handler_task = async {
             if let Err(e) = h.handle(message.clone(), sender, &codec).await {
-                let error = Message::stream_error(message.id, stream_id, e.to_string());
+                let error = Message::stream_error_with_codec(
+                    message.id,
+                    stream_id,
+                    e.to_string(),
+                    codec.clone(),
+                );
                 let _ = send_tx.send(error);
             }
         };
@@ -562,6 +575,39 @@ mod tests {
         result: i32,
     }
 
+    #[derive(Debug, Clone)]
+    struct StatefulCodec {
+        tag: &'static str,
+    }
+
+    impl StatefulCodec {
+        fn configured() -> Self {
+            Self { tag: "configured" }
+        }
+    }
+
+    impl Default for StatefulCodec {
+        fn default() -> Self {
+            Self { tag: "default" }
+        }
+    }
+
+    impl Codec for StatefulCodec {
+        fn encode<T: Serialize>(&self, data: &T) -> Result<Vec<u8>> {
+            let mut encoded = format!("{}:", self.tag).into_bytes();
+            encoded.extend(serde_json::to_vec(data)?);
+            Ok(encoded)
+        }
+
+        fn decode<T: for<'de> Deserialize<'de>>(&self, data: &[u8]) -> Result<T> {
+            let prefix = format!("{}:", self.tag);
+            let payload = data.strip_prefix(prefix.as_bytes()).ok_or_else(|| {
+                RpcError::Serialization(format!("missing {} codec prefix", self.tag))
+            })?;
+            Ok(serde_json::from_slice(payload)?)
+        }
+    }
+
     #[tokio::test]
     async fn test_server_typed_handler() {
         let config = ChannelConfig::default();
@@ -590,6 +636,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_server_errors_use_configured_codec_instance() {
+        let (client_transport, server_transport) =
+            ChannelFrameTransport::create_pair("stateful-error", ChannelConfig::default()).unwrap();
+        let client_channel =
+            MessageChannelAdapter::<_, StatefulCodec>::with_codec(client_transport);
+        let server_channel =
+            MessageChannelAdapter::<_, StatefulCodec>::with_codec(server_transport);
+        let codec = StatefulCodec::configured();
+        let server = RpcServer::with_codec(codec.clone());
+        let server_handle = server.spawn_handler(server_channel);
+        let client = crate::client::RpcClient::with_codec(client_channel, codec);
+        let client_handle = client.start();
+
+        let result: Result<AddResponse> = client.call("missing", &AddRequest { a: 1, b: 2 }).await;
+
+        assert!(matches!(
+            result,
+            Err(RpcError::ServerError(error)) if error.contains("Method not found: missing")
+        ));
+        client.close().await.unwrap();
+        client_handle.join().await.unwrap();
+        server_handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn test_server_stream_handler() {
         let config = ChannelConfig::default();
         let (t1, t2) = ChannelFrameTransport::create_pair("test", config).unwrap();
@@ -599,7 +670,7 @@ mod tests {
 
         let server = RpcServer::new();
         server.register_stream("range", |count: i32| {
-            futures::stream::iter((1..=count).map(|i| Ok(i)))
+            futures::stream::iter((1..=count).map(Ok))
         });
 
         let _handle = server.spawn_handler(server_channel);
@@ -615,17 +686,12 @@ mod tests {
 
         let client_channel_clone = client_channel.clone();
         let recv_task = tokio::spawn(async move {
-            loop {
-                match client_channel_clone.recv().await {
-                    Ok(msg) => {
-                        if msg.msg_type == MessageType::StreamEnd {
-                            manager.handle_message(&msg);
-                            break;
-                        }
-                        manager.handle_message(&msg);
-                    }
-                    Err(_) => break,
+            while let Ok(msg) = client_channel_clone.recv().await {
+                if msg.msg_type == MessageType::StreamEnd {
+                    manager.handle_message(&msg);
+                    break;
                 }
+                manager.handle_message(&msg);
             }
         });
 
@@ -656,7 +722,7 @@ mod tests {
             let called = called_clone.clone();
             async move {
                 called.store(true, Ordering::Release);
-                Ok(Message::reply(MessageId::new(), ())?)
+                Message::reply(MessageId::new(), ())
             }
         });
 
@@ -682,7 +748,7 @@ mod tests {
             |_msg: Message, sender: ServerStreamSender<BincodeCodec>| async move {
                 for i in 0..5 {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    sender.send(i as i32)?;
+                    sender.send(i)?;
                 }
                 sender.end()?;
                 Ok(())
