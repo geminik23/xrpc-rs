@@ -4,15 +4,17 @@
 [![Documentation](https://docs.rs/xrpc-rs/badge.svg)](https://docs.rs/xrpc-rs)
 [![License](https://img.shields.io/crates/l/xrpc-rs)](LICENSE)
 
-Async RPC and local IPC library for Rust with transport flexibility.
+Local-first async RPC and IPC library for Rust with a consistent interface across in-process, shared-memory, Unix socket, and TCP transports.
 
-Start with in-process channels, move to shared memory or Unix sockets for local IPC, and use TCP for network deployment—with the same layered interface.
+Designed primarily for communication between threads and processes on the same machine, while allowing the same RPC model to extend over TCP to trusted networks and small-scale service deployments.
+
+Start locally with Channel, Arc, shared memory, or Unix sockets, then move the same RPC interface to TCP when services need to span multiple hosts.
 
 **Status:** Actively developed. Core features are available, and the API may change between releases.
 
 ## Quick Start
 
-This single-process example uses an in-process channel pair. The same RPC layer can run over shared memory, Unix sockets, or TCP by replacing the frame transport.
+This single-process example uses an in-process channel pair. The same RPC layer can run across local processes over shared memory or Unix sockets, or across hosts over TCP, by replacing the frame transport. Transport configuration and deployment lifecycle differ, but application-level handlers and RPC calls keep the same model.
 
 ```rust
 use serde::{Deserialize, Serialize};
@@ -113,22 +115,24 @@ MessageChannel (Layer 2)
     ↓
 FrameTransport (Layer 1)
     ↓
-Network/IPC
+In-process / Local IPC / TCP
 ```
 
 ## Transport Comparison
 
-| Transport | Use Case | Cross-Process | Serialization |
-|-----------|----------|---------------|---------------|
-| `SharedMemoryFrameTransport` | Cross-process local IPC, one client per named server | Yes | Yes |
-| `TcpFrameTransport` | Network / Remote | Yes | Yes |
-| `UnixFrameTransport` | Local IPC (Unix) | Yes | Yes |
-| `ChannelFrameTransport` | Same-process / Testing | No | Yes |
-| `ArcFrameTransport` | Same-process fast path | No | Frame/RPC: Yes; `ZeroCopyTransport`: No |
+| Transport | Typical Use | Cross-Process | Cross-Host | Serialization |
+|-----------|-------------|---------------|------------|---------------|
+| `ChannelFrameTransport` | Same-process async communication / testing | No | No | Yes |
+| `ArcFrameTransport` | Same-process typed fast path | No | No | Frame/RPC: Yes; `ZeroCopyTransport`: No |
+| `SharedMemoryFrameTransport` | Low-latency local IPC, one client per named server | Yes | No | Yes |
+| `UnixFrameTransport` | Local IPC on Unix systems | Yes | No | Yes |
+| `TcpFrameTransport` | Loopback, trusted LAN, small-scale services | Yes | Yes | Yes |
+
+TCP transport does not provide TLS, authentication, or authorization. Use it within a trusted network or behind an appropriate security boundary.
 
 ## Load Balancing
 
-Distribute requests across multiple server instances:
+Distribute requests across local worker processes or small service instances:
 
 ```rust
 use xrpc::{
@@ -167,7 +171,8 @@ let lb = Arc::new(LoadBalancer::new(discovery, RoundRobin::new()));
 let client = LoadBalancedClient::new(lb, Arc::new(TcpFactory));
 client.init().await?;
 
-// Calls are distributed across servers. Setup failures can fail over before invocation.
+// Calls are distributed across workers or service instances.
+// Setup failures can fail over before invocation.
 let response: Response = client.call("method", &request).await?;
 client.close().await?;
 ```
