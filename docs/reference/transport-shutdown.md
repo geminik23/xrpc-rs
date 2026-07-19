@@ -7,10 +7,18 @@ All frame transports expose terminal local and peer close consistently.
 | Explicit local close | `ConnectionClosed` for later operations | `ConnectionClosed` |
 | Clean peer close at a frame boundary | `ConnectionClosed` | `ConnectionClosed` |
 | Peer closes during a frame | `Protocol` | `Transport(Protocol)` |
-| Timeout before consuming or publishing a frame | `Timeout` while still open | `Transport(Timeout)` |
-| Timeout after partial socket framing | `Timeout`, then terminal | `Transport(Timeout)` |
+| Timeout before consuming or publishing a frame | `Timeout` while still open | Receive loops retry while connected; an individual operation may return `Transport(Timeout)` |
+| Timeout after partial socket framing | `Timeout`, then terminal | `Transport(Timeout)` and session termination |
 | Connection absent before terminal close | `NotConnected` | `Transport(NotConnected)` |
 | Reconnect attempts exhausted | `ConnectionFailed` | `Transport(ConnectionFailed)` |
+
+## RPC receive loops
+
+Both `RpcClient` and `RpcServer` treat a receive timeout as an idle, retryable event only while `MessageChannel::is_connected()` remains true. `RpcServer::serve()` and `serve_sequential()` continue receiving without dropping handlers or the outbound writer channel in that case.
+
+This depends on the `MessageChannel` contract: returning `Timeout` while still connected means that no partial frame or shared commit state was consumed and another receive is safe. A custom channel must report itself disconnected/terminal before returning a timeout after partial progress. Every disconnected timeout and every non-timeout receive error terminates the RPC session.
+
+An explicit local or peer close still wakes the underlying receive operation and is terminal. Transport read timeouts are not application RPC deadlines and do not implement a server session-idle policy.
 
 ## Shared memory
 

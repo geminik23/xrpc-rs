@@ -61,11 +61,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Calling `try_start()` is required before making RPCs. Retaining its handle is optional for ordinary calls, but it enables explicit receive-task joining and forced shutdown. This example retains it for strict cleanup confirmation.
 
+Ordinary unary calls use the client's response timeout. To wait without an application-level response deadline, use explicit call options:
+
+```rust
+use xrpc::CallOptions;
+
+let response: AddResponse = client
+    .call_with_options(
+        "long_operation",
+        &request,
+        CallOptions::without_timeout(),
+    )
+    .await?;
+```
+
+This disables only the RPC response deadline; configured transport I/O timeout policies remain in effect. Client close, terminal connection failure, and dropping the call future still end the local wait, but they do not cancel work already running on the server.
+
 ## Installation
 
 ```toml
 [dependencies]
-xrpc-rs = "0.3.0"
+xrpc-rs = "0.3.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -73,7 +89,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 To enable an optional codec, replace the `xrpc-rs` dependency above with, for example:
 
 ```toml
-xrpc-rs = { version = "0.3.0", features = ["codec-messagepack"] }
+xrpc-rs = { version = "0.3.1", features = ["codec-messagepack"] }
 ```
 
 Available codec features are `codec-messagepack`, `codec-cbor`, `codec-postcard`, and `codec-all`. Bincode and JSON support are available without optional features.

@@ -16,9 +16,17 @@ pub trait MessageChannel<C: Codec = BincodeCodec>: Send + Sync + Debug {
     async fn send(&self, message: &Message<C>) -> TransportResult<()>;
 
     /// Receive an RPC message.
+    ///
+    /// A `TransportError::Timeout` may leave the channel connected only when the receive made no
+    /// partial framing or commit progress and a later receive is safe. Implementations must make
+    /// the channel terminal before returning a timeout after partial progress. RPC serving loops
+    /// use this contract to retry a timeout only while [`MessageChannel::is_connected`] is true.
     async fn recv(&self) -> TransportResult<Message<C>>;
 
-    /// Check if the channel is connected.
+    /// Check if the channel can safely continue message operations.
+    ///
+    /// In particular, this must return `false` after a receive timeout that consumed partial
+    /// framing or commit state and left the message boundary unusable.
     fn is_connected(&self) -> bool;
 
     /// Check if the channel is healthy.

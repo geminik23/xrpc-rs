@@ -29,7 +29,7 @@ pub use channel::serde::SerdeChannel;
 pub use channel::typed::TypedChannel;
 
 // Layer 3: RPC
-pub use client::{RpcClient, RpcClientHandle};
+pub use client::{CallOptions, CallTimeout, RpcClient, RpcClientHandle};
 pub use pool::{ConnectionPool, PoolConfig, PoolGuard};
 pub use server::{
     FnHandler, FnStreamHandler, Handler, RpcServer, ServerHandle, ServerStreamSender,

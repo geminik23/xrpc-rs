@@ -19,15 +19,51 @@ stateDiagram-v2
 
 `close()` marks the client terminal before waiting for admission. New work and uncommitted blocked sends fail with `ConnectionClosed` immediately.
 
-A unary or raw RPC whose transport send already returned success is treated as committed. Its admission guard remains active until the response arrives or the call timeout expires, so explicit close cannot report a committed non-idempotent RPC as `ConnectionClosed`. This means graceful close can wait up to the remaining timeout of committed calls.
+A finite unary or raw RPC whose transport send already returned success is treated as committed. Its admission guard remains active until the response arrives or the call timeout expires, so explicit close cannot report a committed non-idempotent RPC as `ConnectionClosed`. This means graceful close can wait up to the remaining timeout of committed finite calls.
+
+A call using `CallOptions::without_timeout()` has no application response deadline, so it observes the client's existing close/terminal notification after its send commits. Explicit close or terminal connection failure ends that local wait, removes the pending request, and releases admission so close can continue. This does not send request cancellation to the server.
 
 The complete graceful-close workflow is claimed and spawned before its first admission wait. After admitted work exits, that detached workflow stops the receive loop, completes pending local work, starts transport close exactly once, and stores the result. Cancelling the caller while it is still waiting for admission therefore does not abandon shutdown. Concurrent, cancelled, and later close callers all observe the same stored result.
 
 `close()` completes the graceful close workflow without requiring the public handle. If the handle was retained, call `RpcClientHandle::join()` afterward to confirm that the receive task itself has terminated.
 
+## Call response deadlines
+
+`RpcClient::call()` and `RpcClient::call_raw()` use the default response timeout configured on the client. The default is 30 seconds unless another value was supplied to `with_timeout()` or `with_codec_and_timeout()`.
+
+Use `CallOptions` when the timeout policy must be explicit:
+
+```rust
+use std::time::Duration;
+use xrpc::CallOptions;
+
+// Resolve to the timeout configured on RpcClient.
+let default_response: Response = client
+    .call_with_options("method", &request, CallOptions::default())
+    .await?;
+
+// Override the client default for this call.
+let bounded_response: Response = client
+    .call_with_options(
+        "method",
+        &request,
+        CallOptions::with_timeout(Duration::from_secs(2)),
+    )
+    .await?;
+
+// Apply no application-level response deadline.
+let unbounded_response: Response = client
+    .call_with_options("method", &request, CallOptions::without_timeout())
+    .await?;
+```
+
+The typed and raw options APIs have the same lifecycle behavior. `CallTimeout::Disabled` does not disable transport send/read timeouts and does not make the call immune to client close, terminal connection failure, or local future cancellation. A response that is already ready wins if it is observed at the same time as close.
+
+Timeout, close, failure, and dropping the call future remove the local pending registration. None of these events cancel a handler already executing on the server; use a separate application cancel RPC when remote cancellation is required.
+
 ## Receive and send failures
 
-A receive timeout is non-terminal while the transport remains connected. The receive loop continues waiting instead of closing an idle client.
+A retry-safe receive timeout is non-terminal while the transport remains connected. The receive loop continues waiting instead of closing an idle client. A timeout after partial framing must make the channel terminal and is not retried.
 
 A terminal receive error or terminal outbound send error marks the client closed, cancels uncommitted sends, stops the receive loop, and completes pending calls and streams with the normalized original error. Transport close remains single-flight when explicit close races with either failure path.
 

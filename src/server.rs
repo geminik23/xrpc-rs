@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::channel::message::MessageChannel;
 use crate::codec::{BincodeCodec, Codec};
-use crate::error::{Result, RpcError};
+use crate::error::{Result, RpcError, TransportError};
 use crate::message::Message;
 use crate::message::metadata::MessageMetadata;
 use crate::message::types::{MessageId, MessageType};
@@ -35,6 +35,14 @@ pub trait StreamHandler<C: Codec>: Send + Sync {
 
 type HandlerMap<C> = Arc<RwLock<HashMap<String, Arc<dyn Handler<C>>>>>;
 type StreamHandlerMap<C> = Arc<RwLock<HashMap<String, Arc<dyn StreamHandler<C>>>>>;
+
+fn is_connected_idle_timeout<T, C>(transport: &T, error: &TransportError) -> bool
+where
+    T: MessageChannel<C> + ?Sized,
+    C: Codec,
+{
+    matches!(error, TransportError::Timeout { .. }) && transport.is_connected()
+}
 
 pub struct FnHandler<F, C> {
     method: String,
@@ -453,7 +461,8 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let result = loop {
             let message = match transport.recv().await {
                 Ok(msg) => msg,
-                Err(e) => break Err(RpcError::Transport(e)),
+                Err(error) if is_connected_idle_timeout(transport.as_ref(), &error) => continue,
+                Err(error) => break Err(RpcError::Transport(error)),
             };
 
             let handlers = self.handlers.clone();
@@ -494,7 +503,8 @@ impl<C: Codec + Clone + Default + 'static> RpcServer<C> {
         let result = loop {
             let message = match transport.recv().await {
                 Ok(msg) => msg,
-                Err(e) => break Err(RpcError::Transport(e)),
+                Err(error) if is_connected_idle_timeout(transport.as_ref(), &error) => continue,
+                Err(error) => break Err(RpcError::Transport(error)),
             };
 
             Self::dispatch_message(
@@ -560,9 +570,15 @@ impl ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channel::message::MessageChannelAdapter;
+    use crate::channel::message::{MessageChannel, MessageChannelAdapter};
+    use crate::error::TransportResult;
     use crate::streaming::StreamReceiver;
     use crate::transport::channel::{ChannelConfig, ChannelFrameTransport};
+    use parking_lot::Mutex;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
 
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct AddRequest {
@@ -573,6 +589,144 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct AddResponse {
         result: i32,
+    }
+
+    #[derive(Debug)]
+    enum ScriptedReceive {
+        IdleTimeout,
+        Message(Message),
+        DisconnectAfterReply,
+        DisconnectedTimeout,
+        Error(TransportError),
+    }
+
+    #[derive(Debug)]
+    struct ScriptedServerChannel {
+        connected: AtomicBool,
+        received: Mutex<VecDeque<ScriptedReceive>>,
+        sent: Mutex<Vec<Message>>,
+        sent_notify: Notify,
+    }
+
+    impl ScriptedServerChannel {
+        fn new(received: impl IntoIterator<Item = ScriptedReceive>) -> Self {
+            Self {
+                connected: AtomicBool::new(true),
+                received: Mutex::new(received.into_iter().collect()),
+                sent: Mutex::new(Vec::new()),
+                sent_notify: Notify::new(),
+            }
+        }
+
+        async fn wait_for_reply(&self) {
+            loop {
+                let notified = self.sent_notify.notified();
+                if !self.sent.lock().is_empty() {
+                    return;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageChannel for ScriptedServerChannel {
+        async fn send(&self, message: &Message) -> TransportResult<()> {
+            self.sent.lock().push(message.clone());
+            self.sent_notify.notify_waiters();
+            Ok(())
+        }
+
+        async fn recv(&self) -> TransportResult<Message> {
+            let step = self
+                .received
+                .lock()
+                .pop_front()
+                .expect("scripted receive sequence exhausted");
+            match step {
+                ScriptedReceive::IdleTimeout => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    Err(TransportError::Timeout {
+                        duration_ms: 5,
+                        operation: "receive".to_string(),
+                    })
+                }
+                ScriptedReceive::Message(message) => Ok(message),
+                ScriptedReceive::DisconnectAfterReply => {
+                    self.wait_for_reply().await;
+                    self.connected.store(false, Ordering::Release);
+                    Err(TransportError::ConnectionClosed)
+                }
+                ScriptedReceive::DisconnectedTimeout => {
+                    self.connected.store(false, Ordering::Release);
+                    Err(TransportError::Timeout {
+                        duration_ms: 5,
+                        operation: "receive".to_string(),
+                    })
+                }
+                ScriptedReceive::Error(error) => Err(error),
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::Acquire)
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.connected.store(false, Ordering::Release);
+            self.sent_notify.notify_waiters();
+            Ok(())
+        }
+    }
+
+    async fn run_connected_timeout_test(sequential: bool) {
+        let request = Message::call("add", AddRequest { a: 20, b: 22 }).unwrap();
+        let channel = Arc::new(ScriptedServerChannel::new([
+            ScriptedReceive::IdleTimeout,
+            ScriptedReceive::Message(request),
+            ScriptedReceive::DisconnectAfterReply,
+        ]));
+        let server = RpcServer::new();
+        server.register_typed("add", |request: AddRequest| async move {
+            Ok(AddResponse {
+                result: request.a + request.b,
+            })
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            if sequential {
+                server.serve_sequential(Arc::clone(&channel)).await
+            } else {
+                server.serve(Arc::clone(&channel)).await
+            }
+        })
+        .await
+        .expect("server did not finish after the scripted disconnect");
+
+        assert!(matches!(
+            result,
+            Err(RpcError::Transport(TransportError::ConnectionClosed))
+        ));
+        let sent = channel.sent.lock();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg_type, MessageType::Reply);
+        let response: AddResponse = sent[0].deserialize_payload().unwrap();
+        assert_eq!(response.result, 42);
+    }
+
+    async fn run_terminal_receive_test(sequential: bool, step: ScriptedReceive) -> RpcError {
+        let channel = Arc::new(ScriptedServerChannel::new([step]));
+        let server = RpcServer::new();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            if sequential {
+                server.serve_sequential(channel).await
+            } else {
+                server.serve(channel).await
+            }
+        })
+        .await
+        .expect("terminal receive error did not stop the server")
+        .unwrap_err()
     }
 
     #[derive(Debug, Clone)]
@@ -606,6 +760,132 @@ mod tests {
             })?;
             Ok(serde_json::from_slice(payload)?)
         }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_server_survives_connected_idle_timeout() {
+        run_connected_timeout_test(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_sequential_server_survives_connected_idle_timeout() {
+        run_connected_timeout_test(true).await;
+    }
+
+    #[tokio::test]
+    async fn test_disconnected_timeout_remains_terminal_in_both_server_modes() {
+        for sequential in [false, true] {
+            let error =
+                run_terminal_receive_test(sequential, ScriptedReceive::DisconnectedTimeout).await;
+            assert!(matches!(
+                error,
+                RpcError::Transport(TransportError::Timeout { .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_non_timeout_receive_error_remains_terminal_in_both_server_modes() {
+        for sequential in [false, true] {
+            let error = run_terminal_receive_test(
+                sequential,
+                ScriptedReceive::Error(TransportError::Protocol("invalid frame".to_string())),
+            )
+            .await;
+            assert!(matches!(
+                error,
+                RpcError::Transport(TransportError::Protocol(message))
+                    if message == "invalid frame"
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_long_unary_handler_survives_connected_receive_timeouts() {
+        let config = ChannelConfig::default().with_read_timeout(Duration::from_millis(20));
+        let (client_transport, server_transport) =
+            ChannelFrameTransport::create_pair("long-unary-timeout", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(client_transport);
+        let server_channel = MessageChannelAdapter::new(server_transport);
+        let server = RpcServer::new();
+        server.register_typed("slow_add", |request: AddRequest| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(AddResponse {
+                result: request.a + request.b,
+            })
+        });
+        let server_handle = server.spawn_handler(server_channel);
+        let client = crate::client::RpcClient::with_timeout(client_channel, Duration::from_secs(1));
+        let client_handle = client.start();
+
+        let first: AddResponse = client
+            .call("slow_add", &AddRequest { a: 20, b: 22 })
+            .await
+            .unwrap();
+        assert_eq!(first.result, 42);
+        let second: AddResponse = client
+            .call("slow_add", &AddRequest { a: 1, b: 2 })
+            .await
+            .unwrap();
+        assert_eq!(second.result, 3);
+
+        client.close().await.unwrap();
+        client_handle.join().await.unwrap();
+        server_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_delayed_server_stream_survives_connected_receive_timeouts() {
+        let config = ChannelConfig::default().with_read_timeout(Duration::from_millis(20));
+        let (client_transport, server_transport) =
+            ChannelFrameTransport::create_pair("long-stream-timeout", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(client_transport);
+        let server_channel = MessageChannelAdapter::new(server_transport);
+        let server = RpcServer::new();
+        server.register_stream_fn(
+            "delayed_stream",
+            |_request: Message, sender: ServerStreamSender<BincodeCodec>| async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                sender.send("ready".to_string())?;
+                sender.end()?;
+                Ok(())
+            },
+        );
+        let server_handle = server.spawn_handler(server_channel);
+        let client = crate::client::RpcClient::new(client_channel);
+        let client_handle = client.start();
+
+        let mut stream: StreamReceiver<String> = client
+            .call_server_stream("delayed_stream", &())
+            .await
+            .unwrap();
+        assert_eq!(stream.recv().await.unwrap().unwrap(), "ready");
+        assert!(stream.recv().await.is_none());
+
+        client.close().await.unwrap();
+        client_handle.join().await.unwrap();
+        server_handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_explicit_peer_close_interrupts_long_server_receive() {
+        let config = ChannelConfig::default().with_read_timeout(Duration::from_secs(300));
+        let (client_transport, server_transport) =
+            ChannelFrameTransport::create_pair("server-explicit-close", config).unwrap();
+        let client_channel = MessageChannelAdapter::new(client_transport);
+        let server_channel = Arc::new(MessageChannelAdapter::new(server_transport));
+        let server = RpcServer::new();
+        let serve = tokio::spawn(async move { server.serve(server_channel).await });
+
+        client_channel.close().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), serve)
+            .await
+            .expect("explicit peer close did not wake the server receive")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(RpcError::Transport(TransportError::ConnectionClosed))
+        ));
     }
 
     #[tokio::test]

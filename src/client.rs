@@ -17,6 +17,56 @@ use crate::streaming::{StreamId, StreamManager, StreamReceiver, next_stream_id};
 type PendingRequests<C> = Arc<Mutex<HashMap<MessageId, oneshot::Sender<Result<Message<C>>>>>>;
 type ReceiveTaskAbort = Arc<Mutex<Option<AbortHandle>>>;
 
+/// Application-level response deadline policy for an RPC call.
+///
+/// This policy does not change transport send/read timeouts or terminal connection handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CallTimeout {
+    /// Use the default response timeout configured on the [`RpcClient`].
+    ClientDefault,
+    /// Apply the supplied application-level response timeout after the request send commits.
+    After(Duration),
+    /// Wait without an application-level response deadline.
+    ///
+    /// Explicit client close, terminal connection failure, and dropping the call future still
+    /// cancel the local wait. They do not cancel work already running on the server.
+    Disabled,
+}
+
+/// Per-call RPC options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallOptions {
+    timeout: CallTimeout,
+}
+
+impl Default for CallOptions {
+    fn default() -> Self {
+        Self {
+            timeout: CallTimeout::ClientDefault,
+        }
+    }
+}
+
+impl CallOptions {
+    /// Use a specific application-level response timeout for this call.
+    pub const fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            timeout: CallTimeout::After(timeout),
+        }
+    }
+
+    /// Disable only the application-level response deadline for this call.
+    ///
+    /// The local wait remains interruptible by explicit client close, terminal connection
+    /// failure, and future cancellation. No cancellation is propagated to the server.
+    pub const fn without_timeout() -> Self {
+        Self {
+            timeout: CallTimeout::Disabled,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ClientState {
     closed: bool,
@@ -579,13 +629,53 @@ where
         self.stream_manager.clone()
     }
 
+    async fn wait_for_response(
+        &self,
+        msg_id: MessageId,
+        rx: oneshot::Receiver<Result<Message<C>>>,
+        timeout: CallTimeout,
+    ) -> Result<Message<C>> {
+        let timeout = match timeout {
+            CallTimeout::ClientDefault => Some(self.default_timeout),
+            CallTimeout::After(timeout) => Some(timeout),
+            CallTimeout::Disabled => None,
+        };
+
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, rx)
+                .await
+                .map_err(|_| {
+                    RpcError::Timeout(format!("Request {} timed out after {:?}", msg_id, timeout))
+                })?
+                .map_err(|_| RpcError::ConnectionClosed)?,
+            None => {
+                let mut cancel_rx = self.send_cancel_tx.subscribe();
+                if let Some(error) = cancel_rx.borrow().clone() {
+                    return Err(error);
+                }
+
+                tokio::select! {
+                    biased;
+                    response = rx => response.map_err(|_| RpcError::ConnectionClosed)?,
+                    changed = cancel_rx.changed() => {
+                        let _ = changed;
+                        Err(cancel_rx
+                            .borrow()
+                            .clone()
+                            .unwrap_or(RpcError::ConnectionClosed))
+                    }
+                }
+            }
+        }
+    }
+
     /// Make a typed RPC call.
     pub async fn call<Req, Resp>(&self, method: &str, request: &Req) -> Result<Resp>
     where
         Req: Serialize,
         Resp: for<'de> Deserialize<'de>,
     {
-        self.call_with_timeout(method, request, self.default_timeout)
+        self.call_with_options(method, request, CallOptions::default())
             .await
     }
 
@@ -595,6 +685,25 @@ where
         method: &str,
         request: &Req,
         timeout: Duration,
+    ) -> Result<Resp>
+    where
+        Req: Serialize,
+        Resp: for<'de> Deserialize<'de>,
+    {
+        self.call_with_options(method, request, CallOptions::with_timeout(timeout))
+            .await
+    }
+
+    /// Make a typed RPC call with explicit per-call options.
+    ///
+    /// [`CallOptions::without_timeout`] disables only the application response deadline. The
+    /// local wait still ends on explicit client close or terminal connection failure. Dropping
+    /// the call future removes its local pending registration but does not cancel server work.
+    pub async fn call_with_options<Req, Resp>(
+        &self,
+        method: &str,
+        request: &Req,
+        options: CallOptions,
     ) -> Result<Resp>
     where
         Req: Serialize,
@@ -613,12 +722,7 @@ where
 
         self.send_until_committed(&message).await?;
 
-        let response = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| {
-                RpcError::Timeout(format!("Request {} timed out after {:?}", msg_id, timeout))
-            })?
-            .map_err(|_| RpcError::ConnectionClosed)??;
+        let response = self.wait_for_response(msg_id, rx, options.timeout).await?;
 
         match response.msg_type {
             MessageType::Reply => self.codec.decode(&response.payload),
@@ -689,7 +793,7 @@ where
 
     /// Make a raw bytes RPC call.
     pub async fn call_raw(&self, method: &str, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.call_raw_with_timeout(method, payload, self.default_timeout)
+        self.call_raw_with_options(method, payload, CallOptions::default())
             .await
     }
 
@@ -699,6 +803,21 @@ where
         method: &str,
         payload: Vec<u8>,
         timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        self.call_raw_with_options(method, payload, CallOptions::with_timeout(timeout))
+            .await
+    }
+
+    /// Make a raw bytes RPC call with explicit per-call options.
+    ///
+    /// [`CallOptions::without_timeout`] disables only the application response deadline. The
+    /// local wait remains interruptible by explicit client close, terminal connection failure,
+    /// and future cancellation. These local events do not cancel server work.
+    pub async fn call_raw_with_options(
+        &self,
+        method: &str,
+        payload: Vec<u8>,
+        options: CallOptions,
     ) -> Result<Vec<u8>> {
         let _admission = self.admission.read().await;
         {
@@ -720,12 +839,7 @@ where
 
         self.send_until_committed(&message).await?;
 
-        let response = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| {
-                RpcError::Timeout(format!("Request {} timed out after {:?}", msg_id, timeout))
-            })?
-            .map_err(|_| RpcError::ConnectionClosed)??;
+        let response = self.wait_for_response(msg_id, rx, options.timeout).await?;
 
         match response.msg_type {
             MessageType::Reply => Ok(response.payload.to_vec()),
@@ -1124,6 +1238,83 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct DelayedReplyChannel {
+        connected: AtomicBool,
+        delay: Duration,
+        raw: bool,
+        requests: Mutex<VecDeque<(MessageId, Vec<u8>)>>,
+        request_notify: Notify,
+    }
+
+    impl DelayedReplyChannel {
+        fn typed(delay: Duration) -> Self {
+            Self::new(delay, false)
+        }
+
+        fn raw(delay: Duration) -> Self {
+            Self::new(delay, true)
+        }
+
+        fn new(delay: Duration, raw: bool) -> Self {
+            Self {
+                connected: AtomicBool::new(true),
+                delay,
+                raw,
+                requests: Mutex::new(VecDeque::new()),
+                request_notify: Notify::new(),
+            }
+        }
+
+        async fn next_request(&self) -> (MessageId, Vec<u8>) {
+            loop {
+                let notified = self.request_notify.notified();
+                if let Some(request) = self.requests.lock().pop_front() {
+                    return request;
+                }
+                notified.await;
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MessageChannel for DelayedReplyChannel {
+        async fn send(&self, message: &Message) -> TransportResult<()> {
+            self.requests
+                .lock()
+                .push_back((message.id, message.payload.to_vec()));
+            self.request_notify.notify_one();
+            Ok(())
+        }
+
+        async fn recv(&self) -> TransportResult<Message> {
+            let (message_id, payload) = self.next_request().await;
+            tokio::time::sleep(self.delay).await;
+            if self.raw {
+                Ok(Message::new(
+                    message_id,
+                    MessageType::Reply,
+                    "",
+                    payload.into(),
+                    Default::default(),
+                ))
+            } else {
+                Message::reply(message_id, AddResponse { result: 42 })
+                    .map_err(|error| TransportError::Protocol(error.to_string()))
+            }
+        }
+
+        fn is_connected(&self) -> bool {
+            self.connected.load(Ordering::Acquire)
+        }
+
+        async fn close(&self) -> TransportResult<()> {
+            self.connected.store(false, Ordering::Release);
+            self.request_notify.notify_waiters();
+            Ok(())
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct StatefulCodec {
         tag: Arc<str>,
@@ -1161,6 +1352,245 @@ mod tests {
             })?;
             Ok(serde_json::from_slice(payload)?)
         }
+    }
+
+    #[tokio::test]
+    async fn test_call_options_default_and_explicit_timeout_resolution() {
+        let default_client = RpcClient::with_timeout(
+            DelayedReplyChannel::typed(Duration::from_millis(75)),
+            Duration::from_millis(20),
+        );
+        let default_handle = default_client.start();
+        let result: Result<AddResponse> = default_client
+            .call_with_options("add", &AddRequest { a: 20, b: 22 }, CallOptions::default())
+            .await;
+        assert!(matches!(result, Err(RpcError::Timeout(_))));
+        default_client.close().await.unwrap();
+        default_handle.join().await.unwrap();
+
+        let override_client = RpcClient::with_timeout(
+            DelayedReplyChannel::typed(Duration::from_millis(75)),
+            Duration::from_millis(20),
+        );
+        let override_handle = override_client.start();
+        let response: AddResponse = override_client
+            .call_with_options(
+                "add",
+                &AddRequest { a: 20, b: 22 },
+                CallOptions::with_timeout(Duration::from_millis(250)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.result, 42);
+        override_client.close().await.unwrap();
+        override_handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deadline_free_typed_call_exceeds_client_default_timeout() {
+        let client = RpcClient::with_timeout(
+            DelayedReplyChannel::typed(Duration::from_millis(75)),
+            Duration::from_millis(20),
+        );
+        let handle = client.start();
+
+        let response: AddResponse = client
+            .call_with_options(
+                "add",
+                &AddRequest { a: 20, b: 22 },
+                CallOptions::without_timeout(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.result, 42);
+
+        client.close().await.unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_deadline_free_raw_call_exceeds_client_default_timeout() {
+        let client = RpcClient::with_timeout(
+            DelayedReplyChannel::raw(Duration::from_millis(75)),
+            Duration::from_millis(20),
+        );
+        let handle = client.start();
+        let payload = vec![1, 2, 3, 4];
+
+        let response = client
+            .call_raw_with_options("raw", payload.clone(), CallOptions::without_timeout())
+            .await
+            .unwrap();
+        assert_eq!(response, payload);
+
+        client.close().await.unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_close_unblocks_deadline_free_typed_call() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::new(false, false)));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_with_options::<_, AddResponse>(
+                    "add",
+                    &AddRequest { a: 1, b: 2 },
+                    CallOptions::without_timeout(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), client.close())
+            .await
+            .expect("client close was blocked by a deadline-free typed call")
+            .unwrap();
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RpcError::ConnectionClosed)
+        ));
+        assert!(client.pending.lock().is_empty());
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_client_close_unblocks_deadline_free_raw_call() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::new(false, false)));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_raw_with_options("raw", vec![1, 2, 3], CallOptions::without_timeout())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), client.close())
+            .await
+            .expect("client close was blocked by a deadline-free raw call")
+            .unwrap();
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RpcError::ConnectionClosed)
+        ));
+        assert!(client.pending.lock().is_empty());
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_failure_unblocks_deadline_free_typed_call() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::with_receive_error(
+            TransportError::Protocol("terminal typed".to_string()),
+        )));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_with_options::<_, AddResponse>(
+                    "add",
+                    &AddRequest { a: 1, b: 2 },
+                    CallOptions::without_timeout(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+        transport.receive_failed.notify_one();
+
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RpcError::Transport(TransportError::Protocol(message)))
+                if message == "terminal typed"
+        ));
+        assert!(client.pending.lock().is_empty());
+        handle.join().await.unwrap();
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_terminal_failure_unblocks_deadline_free_raw_call() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::with_receive_error(
+            TransportError::Protocol("terminal raw".to_string()),
+        )));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_raw_with_options("raw", vec![1, 2, 3], CallOptions::without_timeout())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+        transport.receive_failed.notify_one();
+
+        assert!(matches!(
+            call.await.unwrap(),
+            Err(RpcError::Transport(TransportError::Protocol(message)))
+                if message == "terminal raw"
+        ));
+        assert!(client.pending.lock().is_empty());
+        handle.join().await.unwrap();
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dropped_deadline_free_typed_call_removes_pending_registration() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::new(false, false)));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_with_options::<_, AddResponse>(
+                    "add",
+                    &AddRequest { a: 1, b: 2 },
+                    CallOptions::without_timeout(),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(client.pending.lock().is_empty());
+
+        client.close().await.unwrap();
+        handle.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_dropped_deadline_free_raw_call_removes_pending_registration() {
+        let client = Arc::new(RpcClient::new(LifecycleTestChannel::new(false, false)));
+        let transport = client.transport();
+        let handle = client.start();
+        let call_client = Arc::clone(&client);
+        let call = tokio::spawn(async move {
+            call_client
+                .call_raw_with_options("raw", vec![1, 2, 3], CallOptions::without_timeout())
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), transport.sent.notified())
+            .await
+            .unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(client.pending.lock().is_empty());
+
+        client.close().await.unwrap();
+        handle.join().await.unwrap();
     }
 
     #[derive(Debug)]

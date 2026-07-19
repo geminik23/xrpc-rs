@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-07-18
+
+### Added
+
+- Added `CallTimeout` and `CallOptions` with `RpcClient::call_with_options()` and `RpcClient::call_raw_with_options()`.
+- Added an explicit deadline-free unary-call policy that remains interruptible by client close, terminal connection failure, and local future cancellation.
+
+### Fixed
+
+- `RpcServer::serve()` and `RpcServer::serve_sequential()` now keep healthy sessions active when a retry-safe receive timeout occurs while the message channel remains connected.
+- Long-running unary handlers, idle connected sessions, and delayed server streams no longer lose their server session solely because no new inbound message arrived during one transport read interval.
+- Deadline-free typed and raw calls release pending registrations and client admission when closed, failed, or dropped, preventing graceful-close deadlocks.
+
 ## [0.3.0] - 2026-07-18
 
 ### Added
